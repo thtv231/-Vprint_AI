@@ -223,15 +223,18 @@ def load_system():
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    vectorstore = Chroma(
-        collection_name=COLLECTION,
-        embedding_function=embeddings,
-        persist_directory=PERSIST_DIR,
+    # Đọc dữ liệu từ file CSV
+    docs = load_csv_docs(CSV_PATH)
+
+    # ĐÃ SỬA: Chạy Vector DB trực tiếp trên RAM, KHÔNG dùng persist_directory
+    vectorstore = Chroma.from_documents(
+        documents=docs,
+        embedding=embeddings,
+        collection_name=COLLECTION
     )
 
     vector_retriever = vectorstore.as_retriever(search_kwargs={"k": K_VECTOR})
-    docs = load_csv_docs(CSV_PATH)
-    
+
     bm25_retriever = BM25Retriever.from_documents(docs)
     bm25_retriever.k = K_BM25
 
@@ -239,6 +242,7 @@ def load_system():
         retrievers=[bm25_retriever, vector_retriever],
         weights=[0.5, 0.5],
     )
+
     return ensemble_retriever, docs, embeddings, device
 
 
