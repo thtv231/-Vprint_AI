@@ -89,9 +89,24 @@ def build_vector_retriever():
     if not os.path.exists(PERSIST_DIR):
         print(f"\n[CẢNH BÁO] Không tìm thấy DB '{PERSIST_DIR}'. Hãy chạy file ingest_bkai.py --rebuild trước!\n")
 
+    import os
+
+if os.path.exists(PERSIST_DIR):
+
     vectorstore = Chroma(
-        collection_name=COLLECTION_NAME,
+        collection_name=COLLECTION,
         embedding_function=embeddings,
+        persist_directory=PERSIST_DIR,
+    )
+
+else:
+
+    docs = load_csv_docs(CSV_PATH)
+
+    vectorstore = Chroma.from_documents(
+        docs,
+        embeddings,
+        collection_name=COLLECTION,
         persist_directory=PERSIST_DIR,
     )
     
