@@ -16,7 +16,8 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
-from langchain.retrievers import EnsembleRetriever
+#from langchain.retrievers import EnsembleRetriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 
 try:
@@ -532,38 +533,38 @@ def format_context(docs: List[Document]) -> str:
     return "\n\n".join(blocks)
 
 
-def build_rag_messages(
-    user_query: str,
-    context_text: str,
-    history: List[Tuple[str, str]],
-    max_history_turns: int,
-):
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
-    recent = history[-max_history_turns:]
-    for user_msg, bot_msg in recent:
-        messages.append(HumanMessage(content=user_msg))
-        messages.append(AIMessage(content=bot_msg))
-
-    instruction = (
-        "Tra loi dung vai tro sales ky thuat VPRINT. "
-        "Uu tien de xuat cu thu. Neu can hoi them, chi hoi 1 cau hoi chot."
-    )
-    if any(x in normalize_for_match(user_query) for x in ["tim may", "muon tim", "de xuat", "goi y"]):
-        instruction = (
-            "De xuat dung 3 may phu hop nhat. "
-            "Moi may can co: ten may, 2-3 diem noi bat, truong hop nen dung."
-        )
-
-    messages.append(
-        HumanMessage(
-            content=(
-                "Ngu canh truy xuat (hybrid rag: vector + bm25):\n"
-                f"{context_text}\n\n"
-                f"Cau hoi khach hang: {user_query}\n\n"
-                f"{instruction}"
-            )
-        )
-    )
+def build_rag_messages(user_query, context, history, max_history=5):
+    system_prompt = f"""
+    Bạn là VPRINT Sales AI, chuyên viên tư vấn thiết bị in ấn, bao bì.
+    Dưới đây là thông tin kỹ thuật được trích xuất từ tài liệu của công ty:
+    {context}
+    
+    🎯 NHIỆM VỤ CỦA BẠN:
+    1. Trả lời chính xác, ngắn gọn dựa trên thông tin được cung cấp.
+    
+    🤝 QUY TẮC XỬ LÝ CÂU HỎI "VƯỢT TẦM" VÀ CHỐT SALE:
+    - Nếu câu hỏi hỏi về GIÁ CẢ cụ thể, CHÍNH SÁCH BẢO HÀNH phức tạp, hoặc yêu cầu mà thông tin trên không có đủ để trả lời chắc chắn: TUYỆT ĐỐI KHÔNG BỊA RA SỐ LIỆU.
+    - Thay vào đó, hãy khéo léo thông báo rằng vấn đề này cần chuyên viên tư vấn chi tiết hơn và CHỦ ĐỘNG XIN THÔNG TIN.
+    - Ví dụ: "Dạ, đối với dòng máy này, để có báo giá và cấu hình chính xác nhất cho xưởng của mình, anh/chị vui lòng để lại **Số điện thoại/Zalo** nhé. Chuyên viên Sales của VPRINT sẽ liên hệ hỗ trợ anh/chị ngay ạ."
+    
+    💡 QUY TẮC ĐỀ XUẤT CÂU HỎI TƯƠNG TÁC (BẮT BUỘC):
+    - Dựa vào nội dung khách hàng vừa hỏi, hãy suy luận xem họ có thể quan tâm đến điều gì tiếp theo (ví dụ: thông số khác của máy, máy cùng phân khúc, vật tư đi kèm...).
+    - Ở phần CUỐI CÙNG của câu trả lời, luôn luôn đề xuất 2-3 câu hỏi gợi ý.
+    - Bắt buộc dùng định dạng sau (không thay đổi format):
+    
+    ---
+    💡 **Có thể bạn quan tâm:**
+    - [Gợi ý 1]
+    - [Gợi ý 2]
+    - [Gợi ý 3]
+    """
+    
+    # ... code xử lý history và trả về mảng messages (giữ nguyên logic của bạn)
+    messages = [("system", system_prompt)]
+    for role, msg in history[-max_history:]:
+        messages.append((role, msg))
+    messages.append(("user", user_query))
+    
     return messages
 
 
