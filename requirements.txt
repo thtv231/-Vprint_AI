@@ -11,3 +11,5 @@ sentence-transformers==5.1.1
 tqdm==4.67.1
 langchain-groq 
 python-dotenv
+fastapi
+uvicorn
