@@ -9,4 +9,4 @@ __pycache__/
 *.pyc
 
 # Bỏ qua database vector nếu nó quá nặng (Tùy chọn)
-# vprint_agentic_db_local/
+# vprint_agentic_db_local/git add .
