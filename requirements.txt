@@ -16,3 +16,4 @@ uvicorn
 gspread
 google-auth
 plotly
+pytz
