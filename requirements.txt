@@ -13,3 +13,6 @@ langchain-groq
 python-dotenv
 fastapi
 uvicorn
+gspread
+google-auth
+plotly

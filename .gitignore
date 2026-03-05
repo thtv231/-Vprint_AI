@@ -1,4 +1,12 @@
-﻿.venv/
-__pycache__/
+﻿# Bỏ qua các file bảo mật
 .env
-venv/
+.streamlit/secrets.toml
+vprint-chat-log-*.json
+
+# Bỏ qua môi trường ảo và thư mục rác của Python
+.venv/
+__pycache__/
+*.pyc
+
+# Bỏ qua database vector nếu nó quá nặng (Tùy chọn)
+# vprint_agentic_db_local/
