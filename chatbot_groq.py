@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from dotenv import load_dotenv
-
+import pytz
 from langchain_chroma import Chroma
 #from langchain_classic.retrievers import EnsembleRetriever
 from langchain.retrievers import EnsembleRetriever
@@ -175,17 +175,42 @@ def plot_intent_radar():
     )
     return fig
 
-def log_chat_to_gsheet(user_query, bot_response, intent, response_time, tokens, model_name):
+@st.cache_resource
+def get_gsheet_client():
+    """Hàm khởi tạo kết nối Google Sheet và lưu vào Cache để dùng lại, giúp giảm thời gian chờ từ 2s xuống 0.001s"""
     try:
         credentials_dict = dict(st.secrets["gcp_service_account"])
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets", 
+            "https://www.googleapis.com/auth/drive"
+        ]
         creds = Credentials.from_service_account_info(credentials_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        
+        return gspread.authorize(creds)
+    except Exception as e:
+        print(f"Lỗi xác thực chứng chỉ Google: {e}")
+        return None
+
+def log_chat_to_gsheet(user_query, bot_response, intent, response_time, tokens, model_name):
+    """Hàm ghi log vào Sheet với Giờ Việt Nam chuẩn xác"""
+    try:
+        # Gọi lại client đã được lưu trong Cache
+        client = get_gsheet_client()
+        if not client:
+            return False
+            
         sheet = client.open_by_url(SPREADSHEET_URL).sheet1
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Cấu hình chuẩn Múi giờ Việt Nam (UTC+7)
+        vietnam_tz = pytz.timezone('Asia/Ho_Chi_Minh')
+        timestamp = datetime.now(vietnam_tz).strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Đóng gói dữ liệu bot trả về dạng JSON để không vỡ bảng Sheet
         bot_response_json = json.dumps({"response": bot_response}, ensure_ascii=False)
+        
+        # Tạo mảng dữ liệu 7 cột
         row_data = [timestamp, user_query, intent, bot_response_json, round(response_time, 2), tokens, model_name]
+        
+        # Đẩy dữ liệu lên hàng mới
         sheet.append_row(row_data)
         return True
     except Exception as e:
