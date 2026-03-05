@@ -52,7 +52,8 @@ if "initialized" not in st.session_state:
     st.session_state.initialized = True
     st.session_state.intent_counts = {
         "find_machine": 0, "spec_query": 0, "book_knowledge": 0, 
-        "normal_rag": 0, "direct_chat": 0, "out_of_domain": 0
+        "normal_rag": 0, "direct_chat": 0, "out_of_domain": 0,
+        "solution_consulting": 0  # <--- THÊM DÒNG NÀY
     }
     st.session_state.api_tokens = 0 
     st.session_state.total_session_tokens = 0 # Tổng token cả phiên
@@ -131,6 +132,14 @@ ROUTING_SAMPLES = {
         "Thời gian giao hàng và lắp đặt mất bao lâu?",
         "Bên bạn có hỗ trợ chuyển giao công nghệ không?",
         "Dịch vụ sau bán hàng của VPRINT thế nào?"
+    ],
+    "solution_consulting": [  
+        "Tôi cần toàn bộ dây chuyền máy để làm ly.",
+        "Xác định dung lượng sản xuất cần thiết (cái/phút) và loại ly để chọn máy.",
+        "Sản lượng 1 triệu/tháng thì cần máy gì?",
+        "Tư vấn giải pháp dây chuyền làm hộp giấy trọn gói từ A-Z.",
+        "Tính toán công suất xưởng cần bao nhiêu máy in để đạt 500 cái/phút.",
+        "Setup xưởng in bao bì nhựa cần đầu tư những máy móc nào?"
     ],
     "direct_chat": [
         "Chào bạn", 
@@ -475,7 +484,34 @@ if user_query:
                         raw_answer += f"\n\n{llm_sug}"
                         
                     with st.chat_message("assistant", avatar="img/logo.png"): st.markdown(raw_answer, unsafe_allow_html=True)
+                elif decision.intent == "solution_consulting":
+                    # Lấy nhiều máy hơn (VD: 6 máy) để AI có nguyên liệu ghép thành dây chuyền
+                    suggested_docs = filtered_docs[:6] 
+                    context = format_context(suggested_docs)
+                    
+                    sys_prompt = f"""Bạn là Kỹ sư Trưởng Tư vấn Giải pháp của VPRINT.
+                    Khách hàng đang yêu cầu tư vấn thiết lập DÂY CHUYỀN sản xuất hoặc TÍNH TOÁN CÔNG SUẤT.
+                    Hãy suy luận từng bước (Step-by-step reasoning):
+                    1. Tính toán thực tế: Nếu khách đưa sản lượng (VD: 1 triệu ly/tháng), hãy tự tính ra tốc độ yêu cầu: Giả sử xưởng làm 26 ngày/tháng, 8 tiếng/ngày -> Công suất cần = [Tính số] cái/phút.
+                    2. Thiết kế dây chuyền: Nêu rõ để làm ra sản phẩm khách yêu cầu (VD: Ly giấy 20oz), cần trải qua các công đoạn nào (In -> Bế -> Ép ly...).
+                    3. Chọn máy phù hợp: Từ [DỮ LIỆU KHO MÁY VPRINT] bên dưới, hãy nhặt ra các máy phù hợp gán vào từng công đoạn. Nếu tốc độ máy trong kho thấp hơn công suất yêu cầu, hãy đề xuất mua 2-3 máy.
+                    4. Trình bày chuyên nghiệp bằng Markdown (Bảng biểu, in đậm). TUYỆT ĐỐI không bịa ra máy không có trong dữ liệu.
 
+                    [DỮ LIỆU KHO MÁY VPRINT]:
+                    {context}
+                    """
+                    messages = [
+                        ("system", sys_prompt),
+                        ("user", f"Yêu cầu khách hàng: '{user_query}'")
+                    ]
+                    
+                    with st.chat_message("assistant", avatar="img/logo.png"):
+                        raw_answer = st.write_stream(stream_response(messages, llm))
+                        
+                    # Gợi ý hành động tiếp theo
+                    sug_prompt = f"Khách vừa hỏi tư vấn giải pháp: '{user_query}'. Viết 3 nút gợi ý hành động tiếp theo ngắn gọn. Bắt buộc Format:\n💡 **Có thể bạn quan tâm:**\n- [Gợi ý 1]\n- [Gợi ý 2]\n- [Gợi ý 3]"
+                    llm_sug = generate_suggestions(llm, sug_prompt)
+                    raw_answer += f"\n\n{llm_sug}"
                 else:
                     messages = build_rag_messages(user_query, context, st.session_state.history, MAX_HISTORY)
                     with st.chat_message("assistant", avatar="img/logo.png"): 
