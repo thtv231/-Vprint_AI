@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 #from langchain.retrievers import EnsembleRetriever
+
 import pandas as pd
 from langchain_core.documents import Document
 
@@ -168,44 +169,69 @@ def build_specs_answer(query: str, doc: Document | None) -> str:
 # ================================
 # PROMPT BUILDERS
 # ================================
+import re
+
+def get_optimized_history(history, max_history=5, max_bot_chars=200):
+    """Nén lịch sử chat để tiết kiệm Input Token"""
+    recent_history = history[-max_history:] if max_history > 0 else []
+    optimized_msgs = []
+    
+    for role, msg in recent_history:
+        if role == "assistant":
+            if len(msg) > max_bot_chars:
+                important_keywords = " ".join(re.findall(r'\*\*(.*?)\*\*', msg))[:100]
+                short_msg = msg[:max_bot_chars] + f"... [Đã thu gọn]. Máy đang đề cập: {important_keywords}"
+                optimized_msgs.append((role, short_msg))
+            else:
+                optimized_msgs.append((role, msg))
+        else:
+            optimized_msgs.append((role, msg))
+            
+    return optimized_msgs
 def build_rag_messages(user_query, context, history, max_history=5):
-    system_prompt = f"""Bạn là Kỹ sư Tư vấn Giải pháp In ấn & Bao bì cấp cao tại VPRINT MACHINERY.
-Dưới đây là thông tin thiết bị trích xuất từ catalog hệ thống:
-{context}
-
-🎯 QUY TRÌNH TƯ VẤN CHUYÊN GIA:
-1. Trả lời chính xác, ngắn gọn dựa trên dữ liệu. KHÔNG bịa thông số, giá cả.
-2. Nếu khách hỏi giá/bảo hành chưa rõ, hãy mời khách để lại SĐT/Zalo.
-3. Luôn gợi mở nhu cầu (Vật liệu, Sản lượng, Ứng dụng cụ thể).
-
-💡 HƯỚNG DẪN TẠO GỢI Ý THÔNG MINH (BẮT BUỘC):
-Kết thúc câu trả lời bằng 3 gợi ý bước tiếp theo, dựa sát vào ngữ cảnh. Format:
-💡 **Có thể bạn quan tâm:**
-- [Gợi ý 1]
-- [Gợi ý 2]
-- [Gợi ý 3]
-"""
-    return [("system", system_prompt)] + history[-max_history:] + [("user", user_query)]
+    sys_prompt = f"""Bạn là Chuyên gia AI của VPRINT.
+    Sử dụng thông tin trong [KHO DỮ LIỆU] dưới đây để trả lời khách hàng.
+    Nếu không có thông tin, hãy nói không biết, TUYỆT ĐỐI KHÔNG BỊA ĐẶT.
+    
+    [KHO DỮ LIỆU]:
+    {context}
+    
+    QUAN TRỌNG: Ở dưới cùng của câu trả lời, BẮT BUỘC cung cấp 3 gợi ý theo đúng định dạng sau:
+    💡 **Có thể bạn quan tâm:**
+    - [Gợi ý 1]
+    - [Gợi ý 2]
+    - [Gợi ý 3]
+    """
+    opt_history = get_optimized_history(history, max_history)
+    return [("system", sys_prompt)] + opt_history + [("user", user_query)]
 
 def build_book_rag_messages(user_query, context, history, max_history=5):
-    system_prompt = f"""Bạn là Kỹ sư Tư vấn Công nghệ In ấn tại VPRINT MACHINERY.
-Dưới đây là các trích đoạn từ Bách khoa toàn thư ngành in (tiếng Anh):
-{context}
+    sys_prompt = f"""Bạn là Kỹ sư In ấn của VPRINT.
+    Dựa vào [CẨM NANG NGÀNH IN] dưới đây để giải đáp thắc mắc kỹ thuật của khách hàng.
+    
+    [CẨM NANG NGÀNH IN]:
+    {context}
+    
+    QUAN TRỌNG: Ở dưới cùng của câu trả lời, BẮT BUỘC cung cấp 3 gợi ý theo đúng định dạng sau:
+    💡 **Có thể bạn quan tâm:**
+    - [Gợi ý 1]
+    - [Gợi ý 2]
+    - [Gợi ý 3]
+    """
+    opt_history = get_optimized_history(history, max_history)
+    return [("system", sys_prompt)] + opt_history + [("user", user_query)]
 
-🎯 NHIỆM VỤ CỦA BẠN:
-1. DỊCH VÀ GIẢI THÍCH: Đọc hiểu tiếng Anh, trả lời bằng TIẾNG VIỆT rõ ràng cho người làm xưởng.
-2. TẠO CẦU NỐI BÁN HÀNG: Sau khi giải thích lý thuyết, hãy tự nhiên liên kết đến giải pháp máy móc của VPRINT.
-
-💡 HƯỚNG DẪN TẠO GỢI Ý THÔNG MINH (BẮT BUỘC):
-Tạo 3 nút gợi ý hành động (dưới 12 chữ) chuyển đổi từ lý thuyết sang tìm kiếm sản phẩm. Format:
-💡 **Có thể bạn quan tâm:**
-- [Gợi ý 1]
-- [Gợi ý 2]
-- [Gợi ý 3]
-"""
-    return [("system", system_prompt)] + history[-max_history:] + [("user", user_query)]
-
-def build_direct_messages(user_query: str, history: List[Tuple[str, str]], max_history_turns: int):
-    system_prompt = """Bạn là trợ lý sales VPRINT. Trả lời ngắn gọn, thân thiện. 
-    Nếu khách cần tư vấn máy, hãy mời họ mô tả chi tiết nhu cầu."""
-    return [("system", system_prompt)] + history[-max_history_turns:] + [("user", user_query)]
+def build_direct_messages(user_query, history, max_history=5):
+    sys_prompt = """Bạn là AI Sales vui vẻ, nhiệt tình của VPRINT.
+    Khách hàng đang trò chuyện xã giao hoặc chào hỏi. 
+    Hãy đáp lại lịch sự, ngắn gọn và khéo léo điều hướng họ hỏi về các dòng máy in, máy bế.
+    Trả lời không quá 3-4 câu.
+    
+    QUAN TRỌNG: Ở dưới cùng của câu trả lời, BẮT BUỘC cung cấp 3 gợi ý theo đúng định dạng sau:
+    💡 **Có thể bạn quan tâm:**
+    - [Gợi ý 1]
+    - [Gợi ý 2]
+    - [Gợi ý 3]
+    """
+    opt_history = get_optimized_history(history, max_history, max_bot_chars=100)
+    return [("system", sys_prompt)] + opt_history + [("user", user_query)]

@@ -17,3 +17,4 @@ gspread
 google-auth
 plotly
 pytz
+langchain-openai
