@@ -1,43 +1,55 @@
-# 🤖 VPRINT Sales AI
+# 🖨️ VPRINT Sales AI - Agentic RAG Consultation Chatbot
 
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
-![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B)
-![LangChain](https://img.shields.io/badge/Framework-LangChain-green)
-![Groq](https://img.shields.io/badge/LLM-Groq-black)
-![ChromaDB](https://img.shields.io/badge/VectorDB-Chroma-orange)
+![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.30%2B-FF4B4B?logo=streamlit&logoColor=white)
+![LangChain](https://img.shields.io/badge/LangChain-⚡-green)
+![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector_Store-orange)
+![LLM](https://img.shields.io/badge/LLM-GPT--4o%20%7C%20Llama--3.1-black)
 
-**VPRINT Sales AI** là một hệ thống Chatbot RAG (Retrieval-Augmented Generation) thông minh, được thiết kế chuyên biệt để hỗ trợ tư vấn bán hàng, tra cứu thông số kỹ thuật và giải đáp thắc mắc về các dòng máy in, máy bế, và thiết bị ngành bao bì.
-
----
-
-## ✨ Tính năng nổi bật
-
-* 🚀 **Bộ định tuyến siêu tốc (Fast Vector Router):** Sử dụng Pytorch và Cosine Similarity để phân loại ý định người dùng (Intent Routing) chỉ trong vài mili-giây, giúp điều hướng câu hỏi về đúng luồng xử lý (Tìm máy, Hỏi thông số, Chat kỹ thuật, hoặc Giao tiếp ngoài lề) mà không tốn token LLM.
-* 🔍 **Tìm kiếm lai (Hybrid Search):** Kết hợp sức mạnh của tìm kiếm từ khóa chính xác (`BM25`) và tìm kiếm ngữ nghĩa (`Vector Search`) thông qua LangChain `EnsembleRetriever`, đảm bảo độ chính xác tuyệt đối khi tra cứu mã máy và thông số kỹ thuật.
-* 🧠 **Quản lý ngữ cảnh thông minh:** Tự động ghi nhớ các thiết bị vừa tư vấn, cho phép người dùng hỏi tiếp các câu hỏi dạng rút gọn (VD: *"Thông số máy này thế nào?"*, *"Bảo hành bao lâu?"*) một cách tự nhiên.
-* 💡 **Nút bấm gợi ý tương tác (Smart UI Pills):** Tự động sinh ra các câu hỏi gợi ý tiếp theo và hiển thị dưới dạng nút bấm UI bo góc (chuẩn phong cách ChatGPT/Claude), giúp tăng trải nghiệm người dùng (UX) và dẫn dắt luồng Sales hiệu quả.
-* 🛡️ **Kiểm soát Out-of-Domain:** Tự động nhận diện và từ chối khéo léo các câu hỏi không thuộc lĩnh vực in ấn/bao bì, đồng thời chủ động xin thông tin (SĐT/Zalo) khi câu hỏi vượt quá khả năng xử lý hoặc liên quan đến báo giá phức tạp.
+> **VPRINT Sales AI** là trợ lý ảo thông minh chuyên sâu cho ngành in ấn và bao bì công nghiệp. Vượt xa kiến trúc RAG thông thường, hệ thống sử dụng **Agentic Workflow** và **Hybrid Search (Vector + BM25 kết hợp RRF)** để tư vấn cấu hình dây chuyền máy móc, giải thích kiến thức kỹ thuật và tự động thu thập thông tin khách hàng tiềm năng (Lead Generation).
 
 ---
 
-## 🛠️ Công nghệ sử dụng
+## ✨ Tính năng Nổi bật (Core Features)
 
-* **Giao diện (UI):** [Streamlit](https://streamlit.io/)
-* **Mô hình ngôn ngữ (LLM):** Llama 3 / Mixtral / Gemma 2 (thông qua [Groq API](https://groq.com/) để tối ưu tốc độ sinh text).
-* **Mô hình nhúng (Embeddings):** `bkai-foundation-models/vietnamese-bi-encoder` (tối ưu cho tiếng Việt).
-* **Cơ sở dữ liệu Vector:** [Chroma](https://www.trychroma.com/) (In-memory).
-* **Khung ứng dụng AI:** [LangChain](https://www.langchain.com/).
+* 🧠 **Semantic Routing & Intent Detection:** Tự động phân loại luồng ý định của người dùng (Tìm máy, Hỏi kiến thức ngành, Tư vấn giải pháp, Trò chuyện) để kích hoạt Pipeline xử lý phù hợp.
+* 🔗 **Sequential Agentic RAG:** Khả năng suy luận đa bước (Multi-step reasoning). Bóc tách yêu cầu khách hàng (sản phẩm, vật liệu, quy mô) -> Phân rã quy trình -> Truy hồi thiết bị chính xác cho từng công đoạn -> Tổng hợp giải pháp dây chuyền.
+* 🎯 **Hybrid Search với Heuristic Boosting:** Kết hợp tìm kiếm ngữ nghĩa (OpenAI Embeddings) và tìm kiếm từ khóa (BM25). Can thiệp điểm số thuật toán RRF bằng Hard-rules (VD: Ép hệ thống không đề xuất máy cuộn cho vật liệu tờ rời).
+* 📚 **Expert Persona (Chuyên gia ngành in):** Trả lời các câu hỏi kỹ thuật sâu (Offset vs Flexo, CTP Thermal vs Violet) dựa trên Cẩm nang nội bộ (Handbook of Print Media).
+* 📩 **Automated Lead Capture:** Tự động nhận diện ý định đặt lịch, trích xuất thông tin liên hệ (Tên, SĐT, Email) và gửi thông báo qua hệ thống SMTP nội bộ.
+* 📊 **Dashboard & Analytics:** Lưu trữ lịch sử hội thoại lên Google Sheets, thống kê lượng Token sử dụng, trực quan hóa luồng Intent bằng biểu đồ Radar.
 
 ---
 
-## 📂 Cấu trúc dự án
+## 🏗️ Kiến trúc Hệ thống (Architecture)
 
-```text
-📁 vprint-sales-ai/
-│
-├── chatbot_groq.py                # File main chạy giao diện Streamlit và luồng chính
-├── chatbot_vprint_hybrid_local.py # Chứa các hàm logic, xử lý dữ liệu và System Prompts
-├── vprint_products_clean.csv      # Database chứa thông tin sản phẩm (Đầu vào cho RAG)
-├── requirements.txt               # Danh sách các thư viện Python cần thiết
-├── .env                           # File chứa biến môi trường (API Keys)
-└── README.md                      # Tài liệu hướng dẫn dự án
+1.  **Giao diện:** Xây dựng trên `Streamlit` với UI/UX được tinh chỉnh (Custom CSS, Typing effect, Thinking indicator).
+2.  **Cơ sở dữ liệu:** * `vprint_knowledge_base`: Kho vector chứa cẩm nang ngành in.
+    * `vprint_products_local`: Kho vector + metadata chứa thông số kỹ thuật máy móc.
+3.  **LLM Engine:** Hỗ trợ chuyển đổi linh hoạt giữa các mô hình mạnh nhất hiện nay:
+    * OpenAI (GPT-4o, GPT-3.5-turbo) cho tư duy logic phức tạp.
+    * Groq (Llama-3.1-8b) cho tốc độ phản hồi siêu tốc (Ultra-fast inference).
+
+---
+
+## 🚀 Cài đặt & Khởi chạy (Installation & Setup)
+
+### 1. Yêu cầu hệ thống
+* Python 3.9 trở lên
+* Git
+
+### 2. Cài đặt môi trường
+```bash
+# Clone repository
+git clone [https://github.com/your-username/vprint-sales-ai.git](https://github.com/your-username/vprint-sales-ai.git)
+cd vprint-sales-ai
+
+# Tạo và kích hoạt virtual environment
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+# Cài đặt thư viện
+pip install -r requirements.txt
