@@ -19,13 +19,23 @@ from email.message import EmailMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from dotenv import load_dotenv
-import pytz
-import streamlit as st
+import pytz 
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+# --- Import từ file logic chung ---
+from chatbot_vprint_hybrid_local import (
+    MachineSummary,
+    MachineSummaryResponse,
+    QueryRewriteResponse,
+    MachineRerankResponse,
+    MachineQueryProfile,
+    deduplicate_docs,
+    format_specs_to_table,
+)
 
 # ==========================================
 # 1. CẤU HÌNH TRANG VÀ KHỞI TẠO SESSION STATE
@@ -202,6 +212,16 @@ def is_book_knowledge_intent(query: str) -> bool:
     book_keywords = ["cong nghe", "la gi", "quy trinh", "su khac biet", "tai sao", "nguyen ly", "kien thuc", "giai thich"]
     return any(k in q for k in book_keywords)
 
+def has_machine_code(query: str) -> bool:
+    """Detects common machine code patterns like VPX-1200, LM-360, CRON H, etc."""
+    # Pattern for codes like VPX-1200, LM360, VP-S54
+    if re.search(r'\b[A-Z]{2,}[-]?\d{3,}\b', query, re.IGNORECASE):
+        return True
+    # Pattern for codes like CRON H 36
+    if re.search(r'\b[A-Z]{3,}\s+[A-Z]\s+\d{2,}\b', query, re.IGNORECASE):
+        return True
+    return False
+
 def is_ctp_knowledge_query(query: str) -> bool:
     q = normalize_for_match(query)
     ctp_terms = ["ctp", "thermal plate", "violet plate", "ban thermal", "ban violet", "computer-to-plate"]
@@ -218,36 +238,47 @@ class RouterDecision:
     use_rag: bool = True
     reset_focus: bool = False
 
-class MachineSummary(BaseModel):
-    description: str = Field(description="1 câu mô tả chức năng chính của máy")
-    performance: str = Field(description="Thông tin tốc độ hoặc hiệu suất nổi bật")
-    technology: str = Field(description="Công nghệ hoặc cấu hình đáng chú ý")
-    advantage: str = Field(description="Điểm ưu việt lớn nhất của máy")
+class ConsultingRequirement(BaseModel):
+    is_clear: bool = Field(description="Đánh giá xem yêu cầu đã đủ rõ ràng để lên cấu hình máy chưa. Trả về False nếu quá mập mờ.")
+    missing_info: List[str] = Field(description="Thông tin cần hỏi lại.")
+    product_type: str = Field(description="Loại sản phẩm (VD: hộp mỹ phẩm, thùng sóng, tem nhãn).")
+    
+    # 2 THUỘC TÍNH MỚI ĐỂ CHỐNG CHỌN SAI LOẠI MÁY
+    material_format: str = Field(description="Định dạng vật liệu in: 'tờ rời' (sheet-fed) hay 'cuộn' (web/roll). VD: Hộp Ivory là tờ rời, decal cuộn là cuộn.")
+    production_scale: str = Field(description="Quy mô sản xuất: 'công nghiệp/tự động' hay 'nhỏ/thủ công'. VD: Hộp cao cấp/sản lượng lớn là công nghiệp tự động.")
+    
+    suggested_processes: List[str] = Field(description="Các công đoạn sản xuất. CHÚ Ý: Nếu là hộp mỹ phẩm/cao cấp, phải có Ép kim (Hot stamping), Dập nổi (Emboss) hoặc Spot UV.")
+    search_keywords: List[str] = Field(description="Từ khóa TỐI ƯU. Phải bao gồm cả định dạng và quy mô để tránh nhầm máy. VD: ['máy bế phẳng tờ rời tự động', 'máy cán màng tự động tốc độ cao', 'máy ép kim tờ rời'].")
 
-class MachineSummaryResponse(BaseModel):
-    summaries: List[MachineSummary] = Field(description="Danh sách tóm tắt theo đúng thứ tự máy đầu vào")
-
-class QueryRewriteResponse(BaseModel):
-    queries: List[str] = Field(description="Danh sách truy vấn viết lại ngắn gọn, cùng ý nghĩa chuyên môn")
-
-class MachineRerankResponse(BaseModel):
-    indices: List[int] = Field(description="Danh sách chỉ số máy phù hợp nhất, theo thứ tự ưu tiên")
-
-class MachineQueryProfile(BaseModel):
-    include_terms: List[str] = Field(description="Từ khóa/cụm từ phải ưu tiên khớp với máy")
-    exclude_terms: List[str] = Field(description="Từ khóa/cụm từ cần loại trừ nếu khác công đoạn")
-
-def _extract_field(text: str, label: str) -> str:
-    m = re.search(rf"{re.escape(label)}\s*:\s*(.+?)(?:\n[A-Za-z ]+\s*:|$)", text, flags=re.IGNORECASE | re.DOTALL)
-    return normalize_text(m.group(1)) if m else ""
+def parse_consulting_request(user_query: str, turn_history: list, llm_main) -> ConsultingRequirement:
+    history_text = "\n".join([f"{r}: {m}" for r, m in turn_history[-4:]]) if turn_history else "Không có"
+    prompt = f"""Bạn là Kỹ sư trưởng thiết kế dây chuyền sản xuất ngành in bao bì.
+    
+    Lịch sử chat: {history_text}
+    Yêu cầu hiện tại: "{user_query}"
+    
+    Quy tắc TỐI QUAN TRỌNG:
+    1. Xác định đúng Định dạng vật liệu (material_format). Các loại hộp giấy (Ivory, Duplex, Bristol) LUÔN LUÔN là "Tờ rời" (Sheet-fed), không bao giờ dùng máy bế cuộn.
+    2. Xác định Quy mô (production_scale). Nếu có chữ "cao cấp", "dây chuyền", "nhà máy", ưu tiên chọn máy "công nghiệp", "tự động" (Automatic).
+    3. Gia công sau in (Finishing): Nếu sản phẩm là hộp mỹ phẩm, hộp cao cấp, BẮT BUỘC thêm công đoạn Ép kim (Hot foil stamping) hoặc UV định hình (Spot UV) vào danh sách quy trình.
+    4. Từ khóa tìm kiếm (search_keywords) phải đính kèm đặc tính. Đừng chỉ ghi "máy bế", hãy ghi "máy bế phẳng tự động tờ rời". Đừng ghi "máy cán màng", hãy ghi "máy cán màng nhiệt tự động công nghiệp".
+    """
+    try:
+        # GPT-4o, GPT-3.5 hoặc Llama 3.1 trên Groq đều hỗ trợ structured output rất tốt
+        structured_llm = llm_main.with_structured_output(ConsultingRequirement)
+        res = structured_llm.invoke([("system", "Bạn là chuyên gia phân tích yêu cầu ngành in."), ("user", prompt)])
+        return res
+    except Exception as e:
+        # Fallback an toàn nếu LLM parse lỗi
+        return ConsultingRequirement(is_clear=True, missing_info=[], product_type="Chưa rõ", material_format="Chưa rõ", production_scale="Chưa rõ", suggested_processes=["Sản xuất in ấn"], search_keywords=[user_query])
 
 def build_fallback_machine_summary(doc: Document) -> MachineSummary:
     raw = str(doc.page_content or "")
-    name = str(doc.metadata.get("name", "")).strip()
-    summary = _extract_field(raw, "Summary")
-    desc = _extract_field(raw, "Description")
-    features = _extract_field(raw, "Features")
-    specs = _extract_field(raw, "Specifications")
+    name = str(doc.metadata.get("name", "")).strip() 
+    summary = extract_labeled_value(raw, "Summary")
+    desc = extract_labeled_value(raw, "Description")
+    features = extract_labeled_value(raw, "Features")
+    specs = extract_labeled_value(raw, "Specifications")
     specs_short = specs[:220] + "..." if len(specs) > 220 else specs
     return MachineSummary(
         description=(summary or desc or f"Thiết bị {name}.")[:260],
@@ -258,6 +289,16 @@ def build_fallback_machine_summary(doc: Document) -> MachineSummary:
 
 def apply_router_guards(user_query: str, decision: RouterDecision) -> RouterDecision:
     q = normalize_for_match(user_query)
+
+    # --- NEW GUARD for Machine Comparison ---
+    is_comparison = any(k in q for k in ["so sanh", "khac nhau", "khac biet"])
+    if is_comparison and has_machine_code(user_query):
+        # If user is comparing specific machine models, it's a consulting task, not a general knowledge question.
+        decision.intent = "solution_consulting"
+        decision.use_rag = True
+        decision.reset_focus = True # Treat as a new query context
+        return decision # Return early to avoid other guards
+
     machine_request_phrases = [
         "may nao",
         "dong may",
@@ -287,7 +328,7 @@ def apply_router_guards(user_query: str, decision: RouterDecision) -> RouterDeci
     has_machine_phrase = any(p in q for p in machine_request_phrases)
     has_knowledge_marker = any(k in q for k in knowledge_markers)
 
-    if decision.intent == "direct_chat" and (has_machine_phrase or (has_machine_anchor and "lam" in q)) and not has_knowledge_marker:
+    if decision.intent in ["direct_chat", "book_knowledge"] and (has_machine_phrase or (has_machine_anchor and "lam" in q)) and not has_knowledge_marker:
         decision.intent = "find_machine"
         decision.use_rag = True
         decision.reset_focus = True
@@ -393,27 +434,25 @@ def build_rag_messages(user_query, context, history, max_history=5):
     return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
 
 def build_book_rag_messages(user_query, context, history, max_history=5):
-    sys_prompt = f"""
-Bạn là **Kỹ sư công nghệ in công nghiệp của VPRINT**.
-Nhiệm vụ: Trả lời câu hỏi kỹ thuật dựa trên **[CẨM NANG NGÀNH IN]**.
+    sys_prompt = f"""Bạn là Chuyên gia Cấp cao về Công nghệ In ấn & Bao bì của VPRINT, với hơn 20 năm kinh nghiệm nghiên cứu, vận hành máy và giảng dạy ngành in.
+    
+Nhiệm vụ của bạn là giải đáp các câu hỏi kỹ thuật ngành in dựa trên [CẨM NANG NGÀNH IN].
 
-**Phong cách trả lời (QUAN TRỌNG):**
-1. **Chuyên môn & Súc tích:** Đi thẳng vào vấn đề, không dẫn dắt dài dòng.
-2. **Cấu trúc hóa:** Ưu tiên sử dụng gạch đầu dòng (bullet points) cho các ý chính.
-3. **Với câu hỏi SO SÁNH (VD: AM vs FM, Offset vs Flexo):**
-   - Hãy trình bày dạng liệt kê thông số kỹ thuật đối lập.
-   - Ví dụ:
-     **Công nghệ A:**
-     - Đặc điểm 1: ...
-     - Đặc điểm 2: ...
-     **Công nghệ B:**
-     - Đặc điểm 1: ...
-     - Đặc điểm 2: ...
-   - Hoặc dùng Bảng so sánh.
+✨ TIÊU CHUẨN CỦA MỘT CHUYÊN GIA:
+1. Sâu sắc & Chính xác: Không chỉ trả lời "Cái gì" (What) mà phải giải thích "Tại sao" (Why) và "Như thế nào" (How).
+2. Thuật ngữ chuyên ngành: Sử dụng đúng thuật ngữ tiếng Việt kèm theo tiếng Anh gốc trong ngoặc đơn nếu cần (VD: trạm màu (color station), hiện tượng tram hóa (dot gain), trục anilox...).
+3. Khách quan: Khi nói về công nghệ, luôn nhìn nhận 2 mặt (ưu/nhược điểm) và đặt vào bối cảnh sản xuất thực tế.
 
-**Quy tắc dữ liệu:**
-- Chỉ dùng thông tin trong [CẨM NANG NGÀNH IN].
-- Tuyệt đối không bịa đặt.
+📝 CẤU TRÚC CÂU TRẢ LỜI BẮT BUỘC (Hãy linh hoạt áp dụng tùy câu hỏi):
+- 🎯 Tóm tắt/Định nghĩa: 1-2 câu ngắn gọn đi thẳng vào bản chất vấn đề.
+- ⚙️ Nguyên lý / Phân tích chuyên sâu: Cấu trúc hóa bằng gạch đầu dòng giải thích cách thức hoạt động hoặc các đặc điểm kỹ thuật cốt lõi.
+- ⚖️ So sánh / Ưu nhược điểm (Nếu câu hỏi mang tính chọn lựa): Đối chiếu các thông số kỹ thuật rõ ràng.
+- 💡 Góc nhìn chuyên gia (Thực tiễn): Lời khuyên ứng dụng trong môi trường xưởng in thực tế (VD: công nghệ này hợp với in bao bì số lượng lớn, hay in tem nhãn ngắn ngày?).
+
+⚠️ QUY TẮC RÀNG BUỘC:
+- CHỈ sử dụng dữ liệu từ [CẨM NANG NGÀNH IN] để làm nền tảng.
+- Tuyệt đối không bịa đặt thông số kỹ thuật.
+- Nếu Cẩm nang không có thông tin chi tiết, hãy nói rõ: "Theo tài liệu kỹ thuật hiện tại của VPRINT chưa đi sâu vào phần này, tuy nhiên..." và vận dụng kiến thức chung để trả lời ở mức độ tổng quan.
 
 [CẨM NANG NGÀNH IN]:
 {context}
@@ -492,12 +531,15 @@ def expand_book_queries(user_query: str, llm_main, max_queries: int = 3) -> List
 
     # Keep retrieval robust for short questions by enriching terms, but avoid long generations.
     prompt = (
-        "Viết lại câu hỏi ngành in thành các biến thể truy vấn ngắn để tìm kiếm tài liệu.\n"
+        "Viết lại câu hỏi ngành in thành các biến thể truy vấn ngắn để tìm kiếm tài liệu chuyên sâu.\n"
         f"Câu hỏi gốc: {base_q}\n"
         "Yêu cầu:\n"
-        "- Trả về 2-3 biến thể, không thêm thông tin mới.\n"
-        "- Ưu tiên thêm thuật ngữ tương đương kỹ thuật nếu có (VD: prepress, CTP, flexographic, anilox).\n"
-        "- Mỗi dòng <= 14 từ."
+        "- Tạo ra 3 truy vấn để quét toàn diện vấn đề này trong sách kỹ thuật.\n"
+        "- Truy vấn 1: Tập trung vào định nghĩa / khái niệm.\n"
+        "- Truy vấn 2: Tập trung vào nguyên lý hoạt động / thông số kỹ thuật.\n"
+        "- Truy vấn 3: Tập trung vào ưu nhược điểm / ứng dụng thực tế.\n"
+        "- Ưu tiên thêm thuật ngữ tiếng Anh tương đương (VD: prepress, CTP, flexographic, anilox, dot gain).\n"
+        "- Mỗi truy vấn <= 12 từ."
     )
     try:
         structured_llm = llm_main.with_structured_output(QueryRewriteResponse)
@@ -628,6 +670,13 @@ def lexical_match_score(user_query: str, doc: Document) -> int:
     unigrams, bigrams, trigrams = extract_query_ngrams(user_query)
     score = 0
 
+    # NÂNG CẤP: Ưu tiên đặc biệt cho các máy làm hộp khi người dùng hỏi về "hộp"
+    q_norm = normalize_for_match(user_query)
+    is_box_query = any(t in q_norm for t in ["hop", "thung carton"])
+    doc_bucket = doc_operation_bucket(doc)
+    if is_box_query and doc_bucket in ["die_cut", "gluing"]:
+        score += 15 # Tăng điểm mạnh cho các máy bế và dán hộp
+
     # Strongly prefer phrase-level matches over generic single words.
     for t in trigrams:
         if t in text:
@@ -640,12 +689,11 @@ def lexical_match_score(user_query: str, doc: Document) -> int:
             score += 1
 
     q_bucket = infer_query_operation_bucket(user_query)
-    d_bucket = doc_operation_bucket(doc)
     if q_bucket != "unknown":
-        if d_bucket == q_bucket:
+        if doc_bucket == q_bucket:
             score += 8
-        elif d_bucket != "unknown":
-            score -= 6
+        elif doc_bucket != "unknown":
+            score -= 8 # Phạt nặng hơn để tránh sai công đoạn
     return score
 
 def pre_rank_machine_candidates(user_query: str, docs, llm_main, top_n: int = 20):
@@ -761,7 +809,7 @@ def quick_intent_classify(user_query: str):
         
     # 2. Find Machine (Tìm máy rõ ràng)
     # Nếu có từ khóa "máy" + hành động cụ thể, và không hỏi "tại sao/là gì"
-    machine_actions = ["tim may", "can mua", "bao gia", "thong so", "may in", "may be", "may dan", "may cat"]
+    machine_actions = ["tim may", "can mua", "bao gia", "thong so", "may in", "may be", "may dan", "may cat", "may nao", "dong may", "loai may"]
     knowledge_markers = ["la gi", "tai sao", "nguyen ly", "khac nhau", "phan biet", "khac gi", "uu diem", "nhuoc diem", "cau tao", "cong dung"]
     consulting_markers = ["tu van", "giai phap", "day chuyen", "xuong in", "ke hoach", "dau tu"]
     
@@ -785,15 +833,16 @@ def build_direct_messages(user_query, history, max_history=5):
     return [("system", sys_prompt)] + get_optimized_history(history, max_history, max_bot_chars=100) + [("user", user_query)]
 
 def build_general_knowledge_fallback_messages(user_query, history, max_history=5):
-    sys_prompt = """Bạn là trợ lý AI của VPRINT, có kiến thức rộng về ngành in.
-    Cẩm nang nội bộ của VPRINT không có thông tin về câu hỏi này.
-    
-    Nhiệm vụ:
-    1. Trả lời câu hỏi của khách hàng dựa trên kiến thức chung của bạn về ngành in.
-    2. BẮT BUỘC phải có một câu disclaimer ở đầu, ví dụ: "Cẩm nang kỹ thuật của VPRINT chưa có thông tin chi tiết về vấn đề này, tuy nhiên, dựa trên kiến thức chung về ngành in thì..."
-    3. Cố gắng trả lời chính xác, cấu trúc rõ ràng.
-    4. Sau khi trả lời, hãy khéo léo gợi ý khách hàng hỏi về các dòng máy VPRINT có liên quan nếu có thể.
-    """
+    sys_prompt = """Bạn là Kỹ sư Trưởng chuyên xử lý sự cố và vận hành xưởng in của VPRINT.
+Hiện tại, hệ thống Cẩm nang nội bộ không chứa tài liệu trực tiếp về câu hỏi này. Tuy nhiên, với kinh nghiệm uyên thâm của mình, bạn hãy tư vấn cho khách hàng dựa trên tiêu chuẩn chung của ngành công nghiệp in (ISO 12647, FOGRA, G7...).
+
+📝 Hướng dẫn trả lời:
+1. Mở đầu bằng một câu rào đón lịch sự: "Dữ liệu cẩm nang nội bộ của VPRINT hiện chưa có tài liệu cụ thể cho vấn đề này. Tuy nhiên, dưới góc độ chuyên môn ngành in, tôi xin chia sẻ như sau:"
+2. Đưa ra các giả thuyết kỹ thuật (Nếu khách hỏi về lỗi in ấn: Liệt kê các nguyên nhân có thể do mực, do giấy, do áp lực lô, do chế bản...).
+3. Đề xuất hướng kiểm tra hoặc khắc phục từng bước (Troubleshooting steps).
+4. Giữ phong thái chuyên nghiệp, dùng từ vựng kỹ thuật chuẩn xác (VD: overprinting, trapping, tack mực, pH nước máng...).
+5. Khéo léo gợi ý khách hàng có thể liên hệ kỹ thuật viên VPRINT để được hỗ trợ chuyên sâu hơn.
+"""
     return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
 
 @contextmanager
@@ -1216,36 +1265,6 @@ def is_garbage_response(text: str) -> bool:
         return True
     return False
 
-def deduplicate_docs(docs):
-    seen, unique_docs = set(), []
-    for d in docs:
-        url = d.metadata.get("product_url", d.page_content[:20])
-        if url not in seen:
-            seen.add(url); unique_docs.append(d)
-    return unique_docs
-
-def format_specs_to_table(spec_text):
-    if not spec_text: return ""
-    try:
-        data = json.loads(spec_text)
-        if not isinstance(data, dict): return spec_text.replace(r'\n', '\n')
-
-        # Handle flat dictionary (Single Model)
-        if all(not isinstance(v, dict) for v in data.values()):
-            header = "| **Thông số** | **Giá trị** |"
-            separator = "|---|---|"
-            rows = [f"| {k} | {v} |" for k, v in data.items()]
-            return "\n".join([header, separator] + rows)
-
-        models = list(data.keys())
-        features = sorted(list({k for md in data.values() if isinstance(md, dict) for k in md.keys()}))
-        if not features: return spec_text.replace(r'\n', '\n')
-        header = "| **Thông số** | " + " | ".join([f"**{m}**" for m in models]) + " |"
-        separator = "|---|" + "|".join(["---"] * len(models)) + "|"
-        rows = [f"| {feat} | " + " | ".join([str(data[m].get(feat, "-")) if isinstance(data[m], dict) else "-" for m in models]) + " |" for feat in features]
-        return "\n".join([header, separator] + rows)
-    except: return spec_text.replace(r'\n', '\n')
-
 # ==========================================
 # 5. LOAD SYSTEM & LLM ROUTER MỚI
 # ==========================================
@@ -1268,7 +1287,15 @@ def load_system():
 
     return vector_retriever, bm25_retriever, book_retriever, machine_embedder
 
-def hybrid_machine_search(user_query: str, vector_retriever, bm25_retriever, top_k: int, llm_main=None):
+def hybrid_machine_search(
+    user_query: str, 
+    vector_retriever, 
+    bm25_retriever, 
+    top_k: int, 
+    llm_main=None, 
+    target_format: str = "", 
+    target_scale: str = ""
+):
     queries = [normalize_text(user_query)]
     if llm_main is not None:
         queries = expand_machine_queries(user_query, llm_main, max_queries=3)
@@ -1281,21 +1308,78 @@ def hybrid_machine_search(user_query: str, vector_retriever, bm25_retriever, top
 
     rrf_k = 60.0
     scored = {}
+    
+    # Hàm phụ để chuẩn hóa text dễ check keyword
+    def get_doc_text(doc):
+        return normalize_for_match(f"{doc.metadata.get('name', '')} {doc.page_content}")
+
+    # Chuẩn hóa target để dễ so sánh
+    t_format = normalize_for_match(target_format)
+    t_scale = normalize_for_match(target_scale)
+
+    # Từ khóa nhận diện
+    sheet_keywords = ["to roi", "sheet fed", "sheet", "to"]
+    web_keywords = ["cuon", "web fed", "roll"]
+    auto_keywords = ["tu dong", "automatic", "cong nghiep", "toc do cao"]
+    manual_keywords = ["thu cong", "ban tu dong", "mini", "nho"]
+
+    # 1. Chấm điểm RRF cơ bản cho Semantic Docs
     for rank, doc in enumerate(semantic_docs, start=1):
-        # Sử dụng row_index làm ID duy nhất để tránh gộp nhầm các máy có mô tả giống nhau
         doc_id = str(doc.metadata.get("row_index")) if "row_index" in doc.metadata else doc.metadata.get("product_url", doc.page_content[:80])
         entry = scored.setdefault(doc_id, {"doc": doc, "score": 0.0})
         entry["score"] += 1.0 / (rrf_k + rank)
 
+    # 2. Chấm điểm RRF cơ bản cho BM25 Docs
     for rank, doc in enumerate(bm25_docs, start=1):
         doc_id = str(doc.metadata.get("row_index")) if "row_index" in doc.metadata else doc.metadata.get("product_url", doc.page_content[:80])
         entry = scored.setdefault(doc_id, {"doc": doc, "score": 0.0})
         entry["score"] += 1.0 / (rrf_k + rank)
 
+    # 3. HEURISTIC BOOSTING & PENALTY (Can thiệp điểm tuyệt đối)
+    for doc_id, entry in scored.items():
+        doc_text = get_doc_text(entry["doc"])
+        
+        # Áp dụng Luật FORMAT (Định dạng vật liệu)
+        if "to roi" in t_format or "sheet" in t_format:
+            # Khách cần "Tờ rời" -> Thấy "Máy cuộn" là phạt cực nặng (hoặc loại luôn bằng cách chia điểm cho 10)
+            if any(k in doc_text for k in web_keywords) and not any(k in doc_text for k in sheet_keywords):
+                entry["score"] = entry["score"] * 0.1 
+            # Ưu tiên cộng điểm lớn nếu ghi rõ máy tờ rời
+            if any(k in doc_text for k in sheet_keywords):
+                entry["score"] += 5.0 # Cộng 5 điểm RRF là một con số khổng lồ (thường RRF < 1.0)
+                
+        elif "cuon" in t_format or "web" in t_format:
+            # Khách cần "Cuộn" -> Phạt máy tờ rời
+            if any(k in doc_text for k in sheet_keywords) and not any(k in doc_text for k in web_keywords):
+                entry["score"] = entry["score"] * 0.1
+            if any(k in doc_text for k in web_keywords):
+                entry["score"] += 5.0
+
+        # Áp dụng Luật SCALE (Quy mô/Công nghiệp)
+        if "cong nghiep" in t_scale or "tu dong" in t_scale:
+            if any(k in doc_text for k in auto_keywords):
+                entry["score"] += 3.0 # Cộng 3 điểm ưu tiên
+            if any(k in doc_text for k in manual_keywords):
+                entry["score"] = entry["score"] * 0.5 # Giảm một nửa điểm nếu là máy mini
+
+    # Sắp xếp và trả về
     merged = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
     return [item["doc"] for item in merged[:top_k]]
 
-def build_decision_llm(groq_api_key, fallback_llm=None):
+def build_decision_llm(groq_api_key, openai_api_key, fallback_llm=None):
+    # Ưu tiên 1: Dùng GPT-3.5-Turbo vì nó rẻ, nhanh và có structured output tốt
+    try:
+        if openai_api_key:
+            return ChatOpenAI(
+                model_name="gpt-3.5-turbo",
+                temperature=0.0,
+                openai_api_key=openai_api_key,
+                max_tokens=50, # Chỉ cần lấy nhãn intent
+            )
+    except Exception:
+        pass
+    
+    # Ưu tiên 2: Dùng Groq Llama 8B nếu có
     try:
         if groq_api_key:
             return ChatGroq(
@@ -1305,6 +1389,8 @@ def build_decision_llm(groq_api_key, fallback_llm=None):
             )
     except Exception:
         pass
+        
+    # Fallback: Dùng model chính
     return fallback_llm
 
 def llm_classify_intent(user_query, llm_main, history=None):
@@ -1335,9 +1421,9 @@ Tiêu chí:
 
 Ưu tiên:
 - **QUAN TRỌNG**: Nếu khách hỏi tìm máy chung chung, không rõ ràng (VD: 'tôi cần máy in', 'tư vấn máy bế') và thiếu các thông tin quan trọng (sản lượng, vật liệu, khổ giấy), hãy chọn **solution_consulting** để bot hỏi lại thông tin, không chọn `find_machine`.
-- **QUAN TRỌNG**: Nếu câu hỏi mang tính tư vấn, so sánh lựa chọn (VD: 'nên dùng A hay B', 'chọn loại nào tốt hơn cho sản phẩm X'), hãy chọn **solution_consulting** hoặc **book_knowledge**, ngay cả khi có tên công nghệ/máy. Đừng chọn `find_machine`.
+- **QUAN TRỌNG**: Nếu câu hỏi so sánh **công nghệ** (VD: 'offset vs flexo'), hãy chọn **book_knowledge**. Nếu so sánh **model máy cụ thể** (VD: 'VPX-1200 vs VPX-800'), hãy chọn **solution_consulting**. Đừng chọn `find_machine` cho các câu so sánh.
 - Nếu câu hỏi nhắc rõ "máy nào", "dòng máy", "model", "thiết bị", "thông số máy" VÀ có đủ chi tiết thì mới chọn `find_machine`.
-- Nếu câu hỏi là "là gì", "khác nhau", "tại sao", "vai trò", "nguyên lý" trong ngữ cảnh ngành in thì chọn book_knowledge.
+- Nếu câu hỏi là "là gì", "tại sao", "vai trò", "nguyên lý" trong ngữ cảnh ngành in thì chọn book_knowledge. Với câu hỏi "khác nhau", hãy xem quy tắc so sánh ở trên.
 - Nếu câu hỏi có nhiều ràng buộc như sản lượng, vật liệu, khổ in, cấu trúc đơn hàng, công đoạn, workflow, đầu tư dây chuyền, chọn solution_consulting.
 - Nếu câu hiện tại là câu làm rõ như "cần xác định gì", "để chọn máy phù hợp", "cần thông tin gì", "xác định dung lượng sản xuất", thì chọn solution_consulting, không chọn find_machine.
 - QUAN TRỌNG: Nếu câu hiện tại có chủ đề KHÁC BIỆT hoàn toàn với lịch sử (VD: đang hỏi kiến thức in Offset sang tìm máy Bế), hãy ưu tiên phân loại theo CÂU HIỆN TẠI và BỎ QUA lịch sử cũ.
@@ -1498,7 +1584,7 @@ if user_query:
     
     start = time.perf_counter()
     history_limit = get_history_limit_for_model(selected_model)
-    llm_decision = build_decision_llm(groq_api_key, llm_main)
+    llm_decision = build_decision_llm(groq_api_key, openai_api_key, llm_main)
     intent_label = llm_classify_intent(user_query, llm_decision or llm_main, turn_history)
     decision = RouterDecision(
         intent=intent_label,
@@ -1534,29 +1620,87 @@ if user_query:
 
         elif decision.intent == "solution_consulting":
             with thinking_indicator():
-                machine_docs = hybrid_machine_search(
-                    user_query,
-                    machine_vector_retriever,
-                    machine_bm25_retriever,
-                    8,
-                    llm_main,
-                )
-                machine_docs = deduplicate_docs(machine_docs)[:6]
+                # --- BƯỚC 1: Bóc tách yêu cầu ---
+                requirement = parse_consulting_request(user_query, turn_history, llm_main)
+                
+                # --- BƯỚC 2: Truy hồi kiến thức Cẩm nang (Luôn cần để làm nền) ---
                 book_docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=4)
+                book_context = format_book_context(book_docs)
+                
+                machine_docs = []
+                machine_context = ""
+                
+                # --- BƯỚC 3: Rẽ nhánh Logic ---
+                if not requirement.is_clear:
+                    # TÌNH HUỐNG A: Yêu cầu mù mờ -> Ngừng tìm máy, chỉ hỏi lại
+                    machine_context = "Chưa tìm kiếm máy vì yêu cầu chưa đủ thông tin đầu vào."
+                    sys_prompt = f"""Bạn là chuyên gia tư vấn giải pháp của VPRINT.
+                    Khách hàng đang nhờ tư vấn, nhưng thông tin quá chung chung.
+                    Phân tích hệ thống cho thấy ta đang thiếu: {', '.join(requirement.missing_info)}
+                    
+                    Nhiệm vụ:
+                    1. Tuyệt đối KHÔNG đề xuất bừa một model máy cụ thể nào ở bước này.
+                    2. Dựa vào [CẨM NANG], giải thích nhẹ nhàng cho khách hiểu tại sao việc xác định các yếu tố trên (như vật liệu, sản lượng) lại quan trọng để chọn đúng máy.
+                    3. Đặt 2-3 câu hỏi ngắn gọn, lịch sự để khách hàng cung cấp thêm thông tin.
+                    
+                    [CẨM NANG NGÀNH IN]:
+                    {book_context}
+                    """
+                    messages = [("system", sys_prompt)] + get_optimized_history(turn_history, history_limit) + [("user", user_query)]
+                
+                else:
+                    # TÌNH HUỐNG B: Yêu cầu đã rõ -> Truy hồi nhắm mục tiêu cho TỪNG công đoạn
+                    for keyword in requirement.search_keywords:
+                        # Tìm kiếm máy chỉ tập trung vào 1 công đoạn cụ thể (VD: "máy cán màng")
+                        process_docs = hybrid_machine_search(
+                            user_query=keyword,
+                            vector_retriever=machine_vector_retriever,
+                            bm25_retriever=machine_bm25_retriever,
+                            top_k=6, 
+                            llm_main=None, # Không gọi LLM expand thêm để tiết kiệm thời gian, keyword đã chuẩn rồi
+                            target_format=requirement.material_format, # Truyền định dạng từ Pydantic
+                            target_scale=requirement.production_scale  # Truyền quy mô từ Pydantic
+                        )
+                        process_docs = deduplicate_docs(process_docs)
+                        
+                        # Rerank lại để lấy đúng 2 máy tốt nhất cho công đoạn này
+                        top_process_docs = rerank_machine_candidates(keyword, process_docs, llm_main, top_k=2)
+                        
+                        if top_process_docs:
+                            machine_docs.extend(top_process_docs)
+                            machine_context += f"\n--- TÌM KIẾM MÁY CHO: {keyword.upper()} ---\n"
+                            machine_context += format_context(top_process_docs)
+                    
+                    # Lọc trùng lặp nếu có máy đa năng (VD: vừa in vừa bế)
+                    machine_docs = deduplicate_docs(machine_docs)
+                    
+                    # Prompt tổng hợp cuối cùng
+                    sys_prompt = f"""Bạn là Kỹ sư trưởng tư vấn giải pháp dây chuyền của VPRINT.
+                    Khách hàng muốn làm sản phẩm: {requirement.product_type}.
+                    Hệ thống đề xuất quy trình gồm: {', '.join(requirement.suggested_processes)}.
+                    
+                    Nhiệm vụ:
+                    1. Nêu tóm tắt workflow.
+                    2. Đề xuất máy. TUYỆT ĐỐI KHÔNG chọn máy cuộn (web-fed) cho vật liệu tờ rời (sheet-fed) và ngược lại.
+                    3. QUAN TRỌNG: Lập một bảng đánh giá sự đồng bộ về Tốc độ/Năng suất của dây chuyền (Dựa vào thông số tốc độ của các máy đề xuất). Chỉ ra đâu có thể là nút thắt cổ chai (bottleneck) nếu chạy thực tế.
+                    4. Chỉ dùng máy trong kho, nếu kho thiếu máy cho công đoạn nào, hãy báo rõ "VPRINT hiện chưa cập nhật dòng máy này trên hệ thống online".
+                    5. Dùng [CẨM NANG] để giải thích thêm (nếu cần thiết) tại sao công nghệ/máy đó lại phù hợp với sản phẩm của khách.
+                    
+                    [KHO MÁY VPRINT LỌC THEO CÔNG ĐOẠN]:
+                    {machine_context}
+                    
+                    [CẨM NANG NGÀNH IN]:
+                    {book_context}
+                    """
+                    messages = [("system", sys_prompt)] + get_optimized_history(turn_history, history_limit) + [("user", user_query)]
 
-            machine_context = format_context(machine_docs)
-            book_context = format_book_context(book_docs)
-            messages = build_solution_consulting_messages(
-                user_query,
-                machine_context,
-                book_context,
-                turn_history,
-                history_limit,
-            )
-            with st.chat_message("assistant", avatar="img/logo.png"):
-                raw_answer = custom_write_stream(stream_response(messages, llm_main))
-            st.session_state.last_docs = machine_docs
-            track_viewed_machines(machine_docs[:3])
+                # --- BƯỚC 4: Generate Output ---
+                with st.chat_message("assistant", avatar="img/logo.png"):
+                    raw_answer = custom_write_stream(stream_response(messages, llm_main))
+                
+                if machine_docs:
+                    st.session_state.last_docs = machine_docs
+                    track_viewed_machines(machine_docs[:3])
 
         elif decision.intent == "find_machine":
             with thinking_indicator():

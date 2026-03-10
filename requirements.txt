@@ -1,21 +1,24 @@
-chromadb==1.5.2
-langchain==0.3.27
-langchain-chroma==0.2.5
-langchain-community==0.3.27
-langchain-huggingface==0.1.2
-langchain-ollama==0.2.2
-pandas==2.3.2
-python-dotenv==1.1.1
-rank-bm25==0.2.2
-sentence-transformers==5.1.1
-tqdm==4.67.1
-langchain-groq 
+# === Core Application Dependencies ===
+streamlit
 python-dotenv
-fastapi
-uvicorn
 gspread
-google-auth
+google-auth-oauthlib
+pandas
 plotly
 pytz
+pydantic
+
+# === LangChain & AI Dependencies ===
+# Main LLM providers
+langchain-groq
 langchain-openai
-langgraph
+
+# Vectorstore & Retrieval
+langchain-chroma
+langchain-community
+chromadb
+rank_bm25
+
+# Core LangChain components
+langchain-core
+tiktoken

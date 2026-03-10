@@ -8,10 +8,11 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 #from langchain.retrievers import EnsembleRetriever
 
 import pandas as pd
+from pydantic import BaseModel, Field
 from langchain_core.documents import Document
 
 # ================================
@@ -98,9 +99,33 @@ def apply_router_guards(user_query: str, decision: RouterDecision) -> RouterDeci
         decision.use_rag = True
     return decision
 
+
+# ================================
+# PYDANTIC MODELS FOR STRUCTURED OUTPUT
+# ================================
+class MachineSummary(BaseModel):
+    description: str = Field(description="1 câu mô tả chức năng chính của máy")
+    performance: str = Field(description="Thông tin tốc độ hoặc hiệu suất nổi bật")
+    technology: str = Field(description="Công nghệ hoặc cấu hình đáng chú ý")
+    advantage: str = Field(description="Điểm ưu việt lớn nhất của máy")
+
+class MachineSummaryResponse(BaseModel):
+    summaries: List[MachineSummary] = Field(description="Danh sách tóm tắt theo đúng thứ tự máy đầu vào")
+
+class QueryRewriteResponse(BaseModel):
+    queries: List[str] = Field(description="Danh sách truy vấn viết lại ngắn gọn, cùng ý nghĩa chuyên môn")
+
+class MachineRerankResponse(BaseModel):
+    indices: List[int] = Field(description="Danh sách chỉ số máy phù hợp nhất, theo thứ tự ưu tiên")
+
+class MachineQueryProfile(BaseModel):
+    include_terms: List[str] = Field(description="Từ khóa/cụm từ phải ưu tiên khớp với máy")
+    exclude_terms: List[str] = Field(description="Từ khóa/cụm từ cần loại trừ nếu khác công đoạn")
+
 # ================================
 # UTILS & FORMATTERS
 # ================================
+
 def extract_labeled_value(text: str, label: str) -> str:
     pattern = rf"{re.escape(label)}:\s*(.*?)(?=\s*[A-Za-z ]+:|$)"
     m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
@@ -143,6 +168,41 @@ def format_book_context(docs: List[Document]) -> str:
         source = doc.metadata.get('source_book', 'Handbook')
         blocks.append(f"[Nguồn: {source} - Đoạn {i}]\n{doc.page_content.strip()}")
     return "\n\n---\n\n".join(blocks)
+
+def deduplicate_docs(docs: List[Document]) -> List[Document]:
+    """Lọc các tài liệu bị trùng lặp dựa trên URL sản phẩm hoặc nội dung."""
+    seen, unique_docs = set(), []
+    for d in docs:
+        url = d.metadata.get("product_url", d.page_content[:20])
+        if url not in seen:
+            seen.add(url); unique_docs.append(d)
+    return unique_docs
+
+def format_specs_to_table(spec_text: str) -> str:
+    """Chuyển đổi chuỗi JSON/dict thông số kỹ thuật thành bảng Markdown."""
+    if not spec_text: return ""
+    try:
+        data = json.loads(spec_text)
+        if not isinstance(data, dict): return spec_text.replace(r'\n', '\n')
+
+        # Xử lý từ điển phẳng (một model)
+        if all(not isinstance(v, dict) for v in data.values()):
+            header = "| **Thông số** | **Giá trị** |"
+            separator = "|---|---|"
+            rows = [f"| {k} | {v} |" for k, v in data.items()]
+            return "\n".join([header, separator] + rows)
+
+        # Xử lý từ điển lồng nhau (nhiều model)
+        models = list(data.keys())
+        features = sorted(list({k for md in data.values() if isinstance(md, dict) for k in md.keys()}))
+        if not features: return spec_text.replace(r'\n', '\n')
+        header = "| **Thông số** | " + " | ".join([f"**{m}**" for m in models]) + " |"
+        separator = "|---|" + "|".join(["---"] * len(models)) + "|"
+        rows = [f"| {feat} | " + " | ".join([str(data[m].get(feat, "-")) if isinstance(data[m], dict) else "-" for m in models]) + " |" for feat in features]
+        return "\n".join([header, separator] + rows)
+    except:
+        # Trả về text gốc nếu không parse được JSON
+        return spec_text.replace(r'\n', '\n')
 
 def parse_specs_to_lines(specs_text: str) -> List[str]:
     raw = specs_text.strip()
