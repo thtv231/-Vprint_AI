@@ -977,8 +977,9 @@ def get_safe_api_key(key_name="GROQ_API_KEY"):
 def detect_booking_lead(text: str):
     q = normalize_for_match(text)
     booking_keywords = [
-        "dat lich", "đặt lịch", "xem may", "xem máy", "tu van truc tiep",
-        "tư vấn trực tiếp", "hen gap", "hẹn gặp", "lien he", "liên hệ"
+        "dat lich", "đặt lịch", "xem may", "xem máy", 
+        "tu van", "tư vấn", "hen gap", "hẹn gặp", "lien he", "liên hệ",
+        "bao gia", "báo giá", "mua may", "mua máy"
     ]
     has_booking_intent = any(k in q for k in booking_keywords)
 
@@ -1764,7 +1765,7 @@ if user_query:
                             )
 
                         if is_spec_request:
-                            specs_txt = _extract_field(doc.page_content, "Specifications")
+                            specs_txt = extract_labeled_value(doc.page_content, "Specifications")
                             if specs_txt:
                                 table = format_specs_to_table(specs_txt)
                                 if table:
