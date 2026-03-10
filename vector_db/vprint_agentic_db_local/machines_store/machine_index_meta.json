@@ -1,0 +1,7 @@
+{
+  "csv_path": "D:\\DA_tech\\chatbot\\vprint_products_clean.csv",
+  "csv_size": 715853,
+  "csv_mtime_ns": 1772439705360951700,
+  "embed_model": "text-embedding-3-small",
+  "collection": "vprint_products_local"
+}

@@ -1,42 +1,31 @@
 import streamlit as st
 import time
 import re
-import torch
 import json
-import ast
 import os
+import threading
+import smtplib
+import unicodedata
+from contextlib import contextmanager
 import gspread
+import pandas as pd
 import plotly.graph_objects as go
+from html import escape, unescape
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+from pydantic import BaseModel, Field
+from email.message import EmailMessage
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from dotenv import load_dotenv
 import pytz
+import streamlit as st
 from langchain_chroma import Chroma
-from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
 from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI # Import thêm OpenAI
-
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings
-except ImportError:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# Import các hàm từ file xử lý local
-from chatbot_vprint_hybrid_local import (
-    load_csv_docs,
-    build_specs_answer,
-    pick_best_doc_for_query,
-    format_context,
-    format_book_context,
-    build_rag_messages,
-    build_book_rag_messages,
-    build_direct_messages,
-    apply_router_guards,
-    parse_images,
-    extract_labeled_value,
-    get_optimized_history
-)
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 # ==========================================
 # 1. CẤU HÌNH TRANG VÀ KHỞI TẠO SESSION STATE
@@ -46,16 +35,26 @@ st.set_page_config(page_title="VPRINT AI", page_icon="img/logo.png", layout="wid
 if "initialized" not in st.session_state:
     st.session_state.history = []
     st.session_state.last_docs = []
-    st.session_state.suggestion_clicked = None 
-    st.session_state.current_suggestions = []  
+    st.session_state.qa_cache = {}
     st.session_state.initialized = True
     st.session_state.intent_counts = {
-        "find_machine": 0, "spec_query": 0, "book_knowledge": 0, 
-        "normal_rag": 0, "direct_chat": 0, "out_of_domain": 0,
-        "solution_consulting": 0
+        "find_machine": 0,
+        "book_knowledge": 0,
+        "solution_consulting": 0,
+        "direct_chat": 0,
     }
     st.session_state.api_tokens = 0 
     st.session_state.total_session_tokens = 0
+    st.session_state.sent_booking_keys = set()
+    st.session_state.viewed_machines = []
+
+# Backward-compatible guard for existing Streamlit sessions
+if "qa_cache" not in st.session_state:
+    st.session_state.qa_cache = {}
+if "sent_booking_keys" not in st.session_state:
+    st.session_state.sent_booking_keys = set()
+if "viewed_machines" not in st.session_state:
+    st.session_state.viewed_machines = []
 
 st.markdown("""
 <style>
@@ -72,6 +71,19 @@ div[data-testid="stVerticalBlock"] div.stButton > button:hover {
 }
 .stChatMessage { font-size: 15px; }
 
+/* CSS cho Spinner */
+.spinner {
+    width: 18px;
+    height: 18px;
+    border: 2.5px solid rgba(0, 0, 0, 0.15);
+    border-top-color: #3b82f6; /* Màu xanh dương giống welcome box */
+    border-radius: 50%;
+    animation: spin 1.2s linear infinite;
+    margin-right: 12px;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
 /* CSS TINH CHỈNH AVATAR CHATBOT */
 div[data-testid="stChatMessageAvatar"] {
     background-color: white !important;
@@ -83,6 +95,42 @@ div[data-testid="stChatMessageAvatar"] img {
     border-radius: 0px !important; 
     padding: 2px !important; 
     transform: scale(1.1); 
+}
+
+.thinking-shell {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 4px 0 10px 0;
+}
+
+.thinking-text {
+    font-size: 16px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: rgba(55, 65, 81, 0.42);
+    background: linear-gradient(
+        110deg,
+        rgba(55, 65, 81, 0.30) 0%,
+        rgba(55, 65, 81, 0.52) 35%,
+        rgba(31, 41, 55, 0.96) 48%,
+        rgba(55, 65, 81, 0.52) 61%,
+        rgba(55, 65, 81, 0.30) 100%
+    );
+    background-size: 220% 100%;
+    background-position: 120% 0;
+    -webkit-background-clip: text;
+    background-clip: text;
+    animation: thinking-shimmer 1.7s ease-in-out infinite;
+}
+
+@keyframes thinking-shimmer {
+    0% {
+        background-position: 120% 0;
+    }
+    100% {
+        background-position: -30% 0;
+    }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -97,12 +145,23 @@ PERSIST_DIR = "vprint_agentic_db_local"
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1GvR6uMGIT0J1MHJplPsepbWDALntCgLAT9ENrhqidEc/edit"
 
 COLLECTION_MACHINES = "vprint_products_local"
-EMBED_MODEL_MACHINES = "bkai-foundation-models/vietnamese-bi-encoder"
+EMBED_MODEL_MACHINES = "text-embedding-3-small"
 
 COLLECTION_BOOK = "vprint_knowledge_base"
-EMBED_MODEL_BOOK = "intfloat/multilingual-e5-large" 
+EMBED_MODEL_BOOK = "text-embedding-3-small"
 
-K_VECTOR, K_BM25, K_FINAL, MAX_HISTORY = 10, 10, 5, 5
+K_VECTOR, K_BM25, K_FINAL, MAX_HISTORY = 20, 20, 5, 5
+SEARCH_POOL_K = 24
+VECTOR_WEIGHT, BM25_WEIGHT = 0.65, 0.35
+MAX_CONTEXT_DOCS = 6
+MAX_CONTEXT_CHARS_PER_DOC = 1200
+INTENT_QUERY_MAX_CHARS = 220
+
+DEFAULT_COLUMNS = [
+    "name", "source_url", "category_id", "product_url", "sku",
+    "price", "view_count", "summary", "description", "features",
+    "specs_json", "unused", "image_urls",
+]
 
 WELCOME = """
 <div style="background-color: #f0f8ff; border-radius: 8px; padding: 16px; border-left: 5px solid #3b82f6; line-height: 1.6; font-size: 15.5px; color: #1e293b; margin-bottom: 20px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
@@ -114,6 +173,673 @@ WELCOME = """
     ⚙️ <b>Tư vấn dây chuyền</b> (Setup xưởng, tính toán sản lượng...)
 </div>
 """
+
+# ==========================================
+# 2.1 TEXT NORMALIZATION + RAG HELPERS
+# ==========================================
+def parse_images(value: str):
+    if not value:
+        return []
+    value = str(value).strip()
+    for sep in [";", ",", "|"]:
+        if sep in value:
+            return [x.strip() for x in value.split(sep) if x.strip()]
+    return [value]
+
+def normalize_text(text: str) -> str:
+    if not text: return ""
+    text = unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text.strip())
+
+def normalize_for_match(text: str) -> str:
+    s = unicodedata.normalize("NFD", text.lower())
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
+
+def is_book_knowledge_intent(query: str) -> bool:
+    q = normalize_for_match(query)
+    book_keywords = ["cong nghe", "la gi", "quy trinh", "su khac biet", "tai sao", "nguyen ly", "kien thuc", "giai thich"]
+    return any(k in q for k in book_keywords)
+
+def is_ctp_knowledge_query(query: str) -> bool:
+    q = normalize_for_match(query)
+    ctp_terms = ["ctp", "thermal plate", "violet plate", "ban thermal", "ban violet", "computer-to-plate"]
+    compare_terms = ["khac nhau", "su khac biet", "phan biet", "so sanh", "phu hop", "moi truong san xuat", "uu nhuoc diem"]
+    machine_buy_terms = ["may", "model", "gia", "bao gia", "dau tu", "xem may", "dat lich", "tu van mua"]
+    has_ctp = any(t in q for t in ctp_terms)
+    has_compare = any(t in q for t in compare_terms)
+    has_buy_intent = any(t in q for t in machine_buy_terms)
+    return has_ctp and (has_compare or not has_buy_intent)
+
+@dataclass
+class RouterDecision:
+    intent: str = "direct_chat"
+    use_rag: bool = True
+    reset_focus: bool = False
+
+class MachineSummary(BaseModel):
+    description: str = Field(description="1 câu mô tả chức năng chính của máy")
+    performance: str = Field(description="Thông tin tốc độ hoặc hiệu suất nổi bật")
+    technology: str = Field(description="Công nghệ hoặc cấu hình đáng chú ý")
+    advantage: str = Field(description="Điểm ưu việt lớn nhất của máy")
+
+class MachineSummaryResponse(BaseModel):
+    summaries: List[MachineSummary] = Field(description="Danh sách tóm tắt theo đúng thứ tự máy đầu vào")
+
+class QueryRewriteResponse(BaseModel):
+    queries: List[str] = Field(description="Danh sách truy vấn viết lại ngắn gọn, cùng ý nghĩa chuyên môn")
+
+class MachineRerankResponse(BaseModel):
+    indices: List[int] = Field(description="Danh sách chỉ số máy phù hợp nhất, theo thứ tự ưu tiên")
+
+class MachineQueryProfile(BaseModel):
+    include_terms: List[str] = Field(description="Từ khóa/cụm từ phải ưu tiên khớp với máy")
+    exclude_terms: List[str] = Field(description="Từ khóa/cụm từ cần loại trừ nếu khác công đoạn")
+
+def _extract_field(text: str, label: str) -> str:
+    m = re.search(rf"{re.escape(label)}\s*:\s*(.+?)(?:\n[A-Za-z ]+\s*:|$)", text, flags=re.IGNORECASE | re.DOTALL)
+    return normalize_text(m.group(1)) if m else ""
+
+def build_fallback_machine_summary(doc: Document) -> MachineSummary:
+    raw = str(doc.page_content or "")
+    name = str(doc.metadata.get("name", "")).strip()
+    summary = _extract_field(raw, "Summary")
+    desc = _extract_field(raw, "Description")
+    features = _extract_field(raw, "Features")
+    specs = _extract_field(raw, "Specifications")
+    specs_short = specs[:220] + "..." if len(specs) > 220 else specs
+    return MachineSummary(
+        description=(summary or desc or f"Thiết bị {name}.")[:260],
+        performance=(specs_short or "Vui lòng liên hệ VPRINT để nhận thông số hiệu suất chi tiết.")[:260],
+        technology=(features or desc or "Cấu hình công nghiệp, vận hành ổn định.")[:260],
+        advantage=(summary or features or "Phù hợp cho nhu cầu sản xuất bao bì.")[:260],
+    )
+
+def apply_router_guards(user_query: str, decision: RouterDecision) -> RouterDecision:
+    q = normalize_for_match(user_query)
+    machine_request_phrases = [
+        "may nao",
+        "dong may",
+        "cac may",
+        "may co the",
+        "tim may",
+        "chon may",
+        "goi y may",
+        "tu van may",
+        "thiet bi",
+        "model",
+        "thong so may",
+        "bao gia may",
+        "may lam",
+    ]
+    knowledge_markers = [
+        "la gi",
+        "nguyen ly",
+        "tai sao",
+        "khac nhau",
+        "phan biet",
+        "so sanh",
+        "quy trinh",
+    ]
+
+    has_machine_anchor = any(t in q for t in [" may ", "may ", " may", "thiet bi", "model"])
+    has_machine_phrase = any(p in q for p in machine_request_phrases)
+    has_knowledge_marker = any(k in q for k in knowledge_markers)
+
+    if decision.intent == "direct_chat" and (has_machine_phrase or (has_machine_anchor and "lam" in q)) and not has_knowledge_marker:
+        decision.intent = "find_machine"
+        decision.use_rag = True
+        decision.reset_focus = True
+    return decision
+
+def extract_labeled_value(text: str, label: str) -> str:
+    pattern = rf"{re.escape(label)}:\s*(.*?)(?=\s*[A-Za-z ]+:|$)"
+    m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    return normalize_text(m.group(1)) if m else ""
+
+def derive_machine_metadata(row: pd.Series):
+    text = normalize_for_match(
+        f"{row.get('name', '')} {row.get('summary', '')} {row.get('description', '')} {row.get('features', '')}"
+    )
+    category = "general"
+    if any(k in text for k in ["ctp", "ghi ban", "ban kem"]):
+        category = "ctp"
+
+    size_tag = ""
+    if any(k in text for k in ["72x102", "72*102", "72 102", "60/72"]):
+        size_tag = "72x102"
+
+    return category, size_tag
+
+def load_csv_docs(csv_path: str):
+    df = pd.read_csv(Path(csv_path), header=0).fillna("")
+    rename_map = {col: DEFAULT_COLUMNS[idx] if idx < len(DEFAULT_COLUMNS) else f"extra_{idx}" for idx, col in enumerate(df.columns)}
+    df = df.rename(columns=rename_map)
+
+    docs = []
+    for idx, row in df.iterrows():
+        category, size_tag = derive_machine_metadata(row)
+        text = "\n".join([
+            f"Product name: {row.get('name', '')}",
+            f"Price: {row.get('price', '')}",
+            f"Summary: {row.get('summary', '')}",
+            f"Description: {row.get('description', '')}",
+            f"Features: {row.get('features', '')}",
+            f"Specifications: {row.get('specs_json', '')}",
+        ]).strip()
+        if text:
+            docs.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        "row_index": int(idx),
+                        "name": str(row.get("name", "")),
+                        "product_url": str(row.get("product_url", "")),
+                        "price": str(row.get("price", "")),
+                        "images": str(row.get("image_urls", "")),
+                        "category": category,
+                        "size_tag": size_tag,
+                    },
+                )
+            )
+    return docs
+
+def format_context(docs):
+    if not docs:
+        return "Khong tim thay tai lieu phu hop."
+    blocks = []
+    for i, doc in enumerate(docs[:MAX_CONTEXT_DOCS], start=1):
+        content = normalize_text(doc.page_content)[:MAX_CONTEXT_CHARS_PER_DOC]
+        blocks.append(
+            f"[Tai lieu {i}]\nTen: {doc.metadata.get('name', '')}\nGia: {doc.metadata.get('price', '')}\nURL: {doc.metadata.get('product_url', '')}\nNoi dung: {content}"
+        )
+    return "\n\n".join(blocks)
+
+def format_book_context(docs):
+    if not docs:
+        return "Không tìm thấy thông tin phù hợp trong cẩm nang."
+
+    blocks = []
+
+    for i, doc in enumerate(docs[:MAX_CONTEXT_DOCS], start=1):
+        content = normalize_text(doc.page_content)[:MAX_CONTEXT_CHARS_PER_DOC]
+
+        blocks.append(content)
+
+    return "\n\n============================\n\n".join(blocks)
+
+def get_optimized_history(history, max_history=5, max_bot_chars=200):
+    recent_history = history[-max_history:] if max_history > 0 else []
+    optimized_msgs = []
+    for role, msg in recent_history:
+        if role == "assistant" and len(msg) > max_bot_chars:
+            important_keywords = " ".join(re.findall(r"\*\*(.*?)\*\*", msg))[:100]
+            short_msg = msg[:max_bot_chars] + f"... [Đã thu gọn]. Máy đang đề cập: {important_keywords}"
+            optimized_msgs.append((role, short_msg))
+        else:
+            optimized_msgs.append((role, msg))
+    return optimized_msgs
+
+def build_rag_messages(user_query, context, history, max_history=5):
+    sys_prompt = f"""Bạn là Chuyên gia AI của VPRINT.
+    Sử dụng thông tin trong [KHO DỮ LIỆU] dưới đây để trả lời khách hàng.
+    Nếu không có thông tin, hãy nói không biết, TUYỆT ĐỐI KHÔNG BỊA ĐẶT.
+    Không lặp lại câu hỏi của người dùng.
+
+    [KHO DỮ LIỆU]:
+    {context}
+    """
+    return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
+
+def build_book_rag_messages(user_query, context, history, max_history=5):
+    sys_prompt = f"""
+Bạn là **Kỹ sư công nghệ in công nghiệp của VPRINT**.
+Nhiệm vụ: Trả lời câu hỏi kỹ thuật dựa trên **[CẨM NANG NGÀNH IN]**.
+
+**Phong cách trả lời (QUAN TRỌNG):**
+1. **Chuyên môn & Súc tích:** Đi thẳng vào vấn đề, không dẫn dắt dài dòng.
+2. **Cấu trúc hóa:** Ưu tiên sử dụng gạch đầu dòng (bullet points) cho các ý chính.
+3. **Với câu hỏi SO SÁNH (VD: AM vs FM, Offset vs Flexo):**
+   - Hãy trình bày dạng liệt kê thông số kỹ thuật đối lập.
+   - Ví dụ:
+     **Công nghệ A:**
+     - Đặc điểm 1: ...
+     - Đặc điểm 2: ...
+     **Công nghệ B:**
+     - Đặc điểm 1: ...
+     - Đặc điểm 2: ...
+   - Hoặc dùng Bảng so sánh.
+
+**Quy tắc dữ liệu:**
+- Chỉ dùng thông tin trong [CẨM NANG NGÀNH IN].
+- Tuyệt đối không bịa đặt.
+
+[CẨM NANG NGÀNH IN]:
+{context}
+"""
+
+    return (
+        [("system", sys_prompt)]
+        + get_optimized_history(history, max_history)
+        + [("user", user_query)]
+    )
+
+def is_comparison_query(user_query: str) -> bool:
+    q = normalize_for_match(user_query)
+    comparison_markers = [
+        "khac nhau",
+        "so sanh",
+        "phan biet",
+        "am screening",
+        "fm screening",
+        "thermal",
+        "violet",
+        "flexo",
+        "gravure",
+    ]
+    return any(marker in q for marker in comparison_markers)
+
+def should_expand_book_answer(user_query: str, raw_answer: str) -> bool:
+    answer = normalize_text(raw_answer)
+    if not answer:
+        return False
+    if len(answer) < 260:
+        return True
+    if is_comparison_query(user_query):
+        lower = normalize_for_match(answer)
+        has_table = "|" in answer
+        lacks_sections = not any(
+            phrase in lower for phrase in ["uu diem", "han che", "ung dung", "nguyen ly", "co che", "su khac nhau"]
+        )
+        return len(answer) < 520 or (has_table and lacks_sections)
+    return False
+
+def expand_book_answer(user_query: str, context: str, raw_answer: str, llm_main):
+    prompt = f"""
+Bạn là biên tập viên kỹ thuật ngành in.
+Nhiệm vụ: Tối ưu hóa câu trả lời dưới đây để **ngắn gọn, súc tích và dễ đọc hơn**.
+
+Câu hỏi: {user_query}
+Dữ liệu nguồn: {context}
+Câu trả lời gốc: {raw_answer}
+
+Yêu cầu biên tập:
+1. **Cấu trúc lại:** Chuyển các đoạn văn thành danh sách gạch đầu dòng (bullet points).
+2. **Làm rõ sự khác biệt (Nếu là so sánh):** Đối chiếu trực tiếp các thông số (VD: Dot size, Dot spacing, LPI...).
+3. **Cắt bỏ:** Các từ nối rườm rà, câu dẫn nhập không cần thiết.
+4. **Giữ nguyên:** Các thuật ngữ chuyên ngành và thông số kỹ thuật chính xác từ dữ liệu nguồn.
+"""
+    try:
+        res = llm_main.invoke(
+            [("system", "Bạn là kỹ sư công nghệ in, chuyên viết lại câu trả lời kỹ thuật cho đầy đủ và bám nguồn."), ("user", prompt)]
+        )
+        expanded = getattr(res, "content", "") or ""
+        return expanded.strip() or raw_answer
+    except Exception:
+        return raw_answer
+
+def is_short_ambiguous_query(user_query: str) -> bool:
+    q = normalize_text(user_query)
+    word_count = len([w for w in q.split(" ") if w.strip()])
+    return len(q) <= 60 or word_count <= 8
+
+def expand_book_queries(user_query: str, llm_main, max_queries: int = 3) -> List[str]:
+    base_q = normalize_text(user_query)
+    # TỐI ƯU: Nếu câu hỏi đã dài (> 10 từ), không cần LLM viết lại để tiết kiệm token
+    if len(base_q.split()) > 10:
+        return [base_q]
+
+    # Keep retrieval robust for short questions by enriching terms, but avoid long generations.
+    prompt = (
+        "Viết lại câu hỏi ngành in thành các biến thể truy vấn ngắn để tìm kiếm tài liệu.\n"
+        f"Câu hỏi gốc: {base_q}\n"
+        "Yêu cầu:\n"
+        "- Trả về 2-3 biến thể, không thêm thông tin mới.\n"
+        "- Ưu tiên thêm thuật ngữ tương đương kỹ thuật nếu có (VD: prepress, CTP, flexographic, anilox).\n"
+        "- Mỗi dòng <= 14 từ."
+    )
+    try:
+        structured_llm = llm_main.with_structured_output(QueryRewriteResponse)
+        res = structured_llm.invoke([("system", "Bạn tối ưu truy vấn retrieval."), ("user", prompt)])
+        candidates = [base_q]
+        q_norm = normalize_for_match(base_q)
+        if "che ban dien tu" in q_norm:
+            candidates.extend([
+                "chế bản điện tử là gì trong prepress",
+                "chế bản điện tử khác in kỹ thuật số như thế nào",
+                "computer to plate ctp trong chế bản offset",
+            ])
+        if res and getattr(res, "queries", None):
+            candidates.extend([normalize_text(x) for x in res.queries if str(x).strip()])
+        # unique, giữ thứ tự
+        dedup = []
+        seen = set()
+        for q in candidates:
+            k = normalize_for_match(q)
+            if k and k not in seen:
+                seen.add(k)
+                dedup.append(q)
+        return dedup[: 1 + max_queries]
+    except Exception:
+        return [base_q]
+
+def expand_machine_queries(user_query: str, llm_main, max_queries: int = 3) -> List[str]:
+    base_q = normalize_text(user_query)
+    # TỐI ƯU: Nếu câu hỏi đã dài (> 10 từ), không cần LLM viết lại
+    if len(base_q.split()) > 10:
+        return [base_q]
+
+    prompt = (
+        "Viết lại câu hỏi tìm máy thành các truy vấn ngắn để truy hồi chính xác hơn.\n"
+        f"Câu hỏi gốc: {base_q}\n"
+        "Yêu cầu:\n"
+        "- Trả 2-3 biến thể ngắn, không thêm thông tin mới.\n"
+        "- Ưu tiên từ khóa công đoạn/chức năng/vật liệu (VD: ép nhũ, tráng phủ, bế, dán nếu là gia công sau in).\n"
+        "- Nếu câu hỏi về 'hộp', 'bao bì', 'mỹ phẩm', 'gia công sau in', hãy BẮT BUỘC mở rộng sang các từ khóa quy trình đầy đủ: ép nhũ (hot foil), dập nổi (embossing), tráng phủ (coating/laminating), bế (die-cutting), dán hộp (folder gluer).\n"
+        "- Mỗi dòng <= 12 từ."
+    )
+    try:
+        structured_llm = llm_main.with_structured_output(QueryRewriteResponse)
+        res = structured_llm.invoke([("system", "Bạn tối ưu truy vấn tìm máy."), ("user", prompt)])
+        candidates = [base_q]
+        if res and getattr(res, "queries", None):
+            candidates.extend([normalize_text(x) for x in res.queries if str(x).strip()])
+        dedup, seen = [], set()
+        for q in candidates:
+            k = normalize_for_match(q)
+            if k and k not in seen:
+                seen.add(k)
+                dedup.append(q)
+        return dedup[: 1 + max_queries]
+    except Exception:
+        return [base_q]
+
+def build_machine_query_profile(user_query: str, llm_main) -> MachineQueryProfile:
+    prompt = f"""Phân tích câu hỏi tìm máy và trích xuất profile truy hồi.
+Câu hỏi: {user_query}
+Yêu cầu:
+- include_terms: 3-8 cụm từ ngắn mô tả đúng công đoạn/chức năng/vật liệu.
+- exclude_terms: 0-5 cụm từ thể hiện công đoạn dễ nhầm nhưng không phải mục tiêu.
+- Không thêm tên máy không có trong câu hỏi.
+"""
+    try:
+        profiler = llm_main.with_structured_output(MachineQueryProfile)
+        res = profiler.invoke([("system", "Bạn trích xuất profile truy hồi tìm máy."), ("user", prompt)])
+        include_terms = [normalize_for_match(t) for t in (getattr(res, "include_terms", []) or []) if str(t).strip()]
+        exclude_terms = [normalize_for_match(t) for t in (getattr(res, "exclude_terms", []) or []) if str(t).strip()]
+        if include_terms:
+            return MachineQueryProfile(include_terms=include_terms[:8], exclude_terms=exclude_terms[:5])
+    except Exception:
+        pass
+
+    toks = re.findall(r"[a-z0-9]+", normalize_for_match(user_query))
+    stop = {"may", "nao", "dung", "de", "cho", "toi", "anh", "chi", "la", "gi", "vprint"}
+    include = [t for t in toks if t not in stop and len(t) >= 2][:8]
+    return MachineQueryProfile(include_terms=include, exclude_terms=[])
+
+def score_doc_with_profile(doc: Document, profile: MachineQueryProfile) -> int:
+    text = normalize_for_match(f"{doc.metadata.get('name', '')} {doc.page_content}")
+    include_hits = sum(1 for t in profile.include_terms if t and t in text)
+    exclude_hits = sum(1 for t in profile.exclude_terms if t and t in text)
+    return include_hits * 3 - exclude_hits * 2
+
+def extract_query_ngrams(user_query: str):
+    toks = re.findall(r"[a-z0-9]+", normalize_for_match(user_query))
+    stop = {"may", "nao", "dung", "de", "cho", "toi", "anh", "chi", "la", "gi", "vprint", "tren", "voi"}
+    toks = [t for t in toks if t not in stop and len(t) >= 2]
+    unigrams = toks[:12]
+    bigrams = [f"{toks[i]} {toks[i+1]}" for i in range(len(toks) - 1)]
+    trigrams = [f"{toks[i]} {toks[i+1]} {toks[i+2]}" for i in range(len(toks) - 2)]
+    return unigrams, bigrams, trigrams
+
+def infer_query_operation_bucket(user_query: str) -> str:
+    q = normalize_for_match(user_query)
+    buckets = {
+        "lamination": ["can mang", "lamination", "bopp"],
+        "gluing": ["dan hop", "folder gluer", "gluer"],
+        "die_cut": ["be", "cat be", "die cut"],
+        "drilling": ["khoan", "drill"],
+        "ctp": ["ctp", "ghi ban", "ban kem"],
+        "printing": ["in", "offset", "flexo", "gravure", "digital"],
+    }
+    for b, terms in buckets.items():
+        if any(t in q for t in terms):
+            return b
+    return "unknown"
+
+def doc_operation_bucket(doc: Document) -> str:
+    text = normalize_for_match(f"{doc.metadata.get('name', '')} {doc.page_content}")
+    bucket_terms = [
+        ("lamination", ["can mang", "lamination", "bopp"]),
+        ("gluing", ["dan hop", "folder gluer", "gluer"]),
+        ("die_cut", ["cat be", "die cut", "be"]),
+        ("drilling", ["khoan", "drill"]),
+        ("ctp", ["ctp", "ghi ban", "ban kem"]),
+        ("printing", ["may in", "offset", "flexo", "gravure", "digital"]),
+    ]
+    for b, terms in bucket_terms:
+        if any(t in text for t in terms):
+            return b
+    return "unknown"
+
+def lexical_match_score(user_query: str, doc: Document) -> int:
+    text = normalize_for_match(f"{doc.metadata.get('name', '')} {doc.page_content}")
+    unigrams, bigrams, trigrams = extract_query_ngrams(user_query)
+    score = 0
+
+    # Strongly prefer phrase-level matches over generic single words.
+    for t in trigrams:
+        if t in text:
+            score += 10
+    for t in bigrams:
+        if t in text:
+            score += 5
+    for t in unigrams:
+        if t in text:
+            score += 1
+
+    q_bucket = infer_query_operation_bucket(user_query)
+    d_bucket = doc_operation_bucket(doc)
+    if q_bucket != "unknown":
+        if d_bucket == q_bucket:
+            score += 8
+        elif d_bucket != "unknown":
+            score -= 6
+    return score
+
+def pre_rank_machine_candidates(user_query: str, docs, llm_main, top_n: int = 20):
+    if not docs:
+        return []
+    profile = build_machine_query_profile(user_query, llm_main)
+    scored = []
+    for d in docs:
+        p_score = score_doc_with_profile(d, profile)
+        l_score = lexical_match_score(user_query, d)
+        scored.append((p_score + l_score, d))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    positives = [d for s, d in scored if s >= 3]
+    if positives:
+        return positives[:top_n]
+    return [d for _, d in scored[:top_n]]
+
+def retrieve_book_with_rrf(user_query: str, book_retriever, llm_main, top_k: int = 8) -> List[Document]:
+    # RAG Fusion + RRF path for short/ambiguous knowledge queries (e.g. "chế bản điện tử là gì").
+    queries = [normalize_text(user_query)]
+    if is_short_ambiguous_query(user_query):
+        queries = expand_book_queries(user_query, llm_main, max_queries=3)
+
+    rrf_k = 60.0
+    scored = {}
+    for q in queries:
+        try:
+            docs = book_retriever.invoke(q)
+        except Exception:
+            docs = []
+        for rank, doc in enumerate(docs, start=1):
+            doc_id = f"{doc.metadata.get('source_book', 'book')}::{normalize_for_match(doc.page_content[:120])}"
+            entry = scored.setdefault(doc_id, {"doc": doc, "score": 0.0})
+            entry["score"] += 1.0 / (rrf_k + rank)
+
+    merged = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
+    return [item["doc"] for item in merged[:top_k]]
+
+def get_history_limit_for_model(model_name: str) -> int:
+    if model_name == "gpt-3.5-turbo":
+        return 3
+    return MAX_HISTORY
+
+def make_query_cache_key(query: str) -> str:
+    return f"v20::{normalize_for_match(query)}"
+
+def is_context_dependent_query(query: str) -> bool:
+    q = normalize_for_match(query)
+    followup_markers = [
+        "y tren",
+        "cau tren",
+        "nhu tren",
+        "o tren",
+        "vua noi",
+        "giai thich them",
+        "noi ro hon",
+        "chi tiet hon",
+        "vi sao vay",
+        "tai sao vay",
+        "truong hop nay",
+        "van de nay",
+        "phan nay",
+        "phan do",
+        "cai nay",
+        "cai do",
+        "nhu vay",
+        "tiep theo",
+        "them nua",
+        "gia bao nhieu", "bao nhieu tien", "thong so the nao", "cau hinh ra sao"
+    ]
+    if any(m in q for m in followup_markers):
+        return True
+
+    # Keep previous machine-consulting contextual cues.
+    machine_markers = [
+        "de chon may phu hop",
+        "can xac dinh",
+        "xac dinh dung luong",
+        "can thong tin gi",
+        "nhung yeu to nao",
+        "truoc khi chon may",
+        "nen xac dinh",
+        "don hang nay",
+    ]
+    if any(m in q for m in machine_markers):
+        return True
+
+    # Nếu câu hỏi chứa từ khóa tìm kiếm máy rõ ràng, coi như là context mới (Reset)
+    new_search_signals = [
+        "tim may", "cho xem", "can mua", "bao gia may", "dong may", "loai may",
+        "may in", "may be", "may dan", "may cat", "may ep", "may trang", "may gap", "may lam"
+    ]
+    if any(s in q for s in new_search_signals):
+        # Trừ khi có từ chỉ định trỏ về cái cũ rõ ràng
+        if not any(p in q for p in ["nay", "do", "vua roi", "tren", "cu", "vua xem"]):
+            return False
+
+    tokens = [w for w in re.findall(r"[a-z0-9]+", q) if w.strip()]
+    if len(tokens) <= 7:
+        pronouns = {"nay", "do", "no", "vay", "them", "con", "roi"}
+        if any(t in pronouns for t in tokens):
+            return True
+    return False
+
+def quick_intent_classify(user_query: str):
+    # TỐI ƯU: Sử dụng quy tắc từ khóa để bỏ qua LLM Router cho các trường hợp rõ ràng
+    q = normalize_for_match(user_query)
+    
+    # 1. Direct Chat (Chào hỏi, cảm ơn)
+    direct_keywords = ["xin chao", "hello", "hi bot", "cam on", "tam biet", "ban la ai", "giup gi duoc"]
+    if any(k == q for k in direct_keywords) or len(q) < 3:
+        return "direct_chat"
+        
+    # 2. Find Machine (Tìm máy rõ ràng)
+    # Nếu có từ khóa "máy" + hành động cụ thể, và không hỏi "tại sao/là gì"
+    machine_actions = ["tim may", "can mua", "bao gia", "thong so", "may in", "may be", "may dan", "may cat"]
+    knowledge_markers = ["la gi", "tai sao", "nguyen ly", "khac nhau", "phan biet", "khac gi", "uu diem", "nhuoc diem", "cau tao", "cong dung"]
+    consulting_markers = ["tu van", "giai phap", "day chuyen", "xuong in", "ke hoach", "dau tu"]
+    
+    if any(k in q for k in machine_actions) and not any(k in q for k in knowledge_markers):
+        # Nếu có từ khóa tư vấn/giải pháp, hãy để LLM quyết định (thường là solution_consulting) thay vì ép về find_machine
+        if any(c in q for c in consulting_markers):
+            return None
+            
+        # Đảm bảo không phải là câu hỏi tư vấn phức tạp (quá dài)
+        if len(q.split()) < 15: 
+            return "find_machine"
+            
+    return None # Nếu không chắc chắn, để LLM quyết định
+
+def build_direct_messages(user_query, history, max_history=5):
+    sys_prompt = """Bạn là trợ lý AI của VPRINT.
+    Đây là cuộc trò chuyện thông thường, chào hỏi hoặc câu hỏi không cần truy hồi dữ liệu.
+    Hãy trả lời tự nhiên, lịch sự, ngắn gọn.
+    Nếu phù hợp, có thể gợi ý khách hỏi thêm về máy móc hoặc công nghệ ngành in.
+    """
+    return [("system", sys_prompt)] + get_optimized_history(history, max_history, max_bot_chars=100) + [("user", user_query)]
+
+def build_general_knowledge_fallback_messages(user_query, history, max_history=5):
+    sys_prompt = """Bạn là trợ lý AI của VPRINT, có kiến thức rộng về ngành in.
+    Cẩm nang nội bộ của VPRINT không có thông tin về câu hỏi này.
+    
+    Nhiệm vụ:
+    1. Trả lời câu hỏi của khách hàng dựa trên kiến thức chung của bạn về ngành in.
+    2. BẮT BUỘC phải có một câu disclaimer ở đầu, ví dụ: "Cẩm nang kỹ thuật của VPRINT chưa có thông tin chi tiết về vấn đề này, tuy nhiên, dựa trên kiến thức chung về ngành in thì..."
+    3. Cố gắng trả lời chính xác, cấu trúc rõ ràng.
+    4. Sau khi trả lời, hãy khéo léo gợi ý khách hàng hỏi về các dòng máy VPRINT có liên quan nếu có thể.
+    """
+    return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
+
+@contextmanager
+def thinking_indicator():
+    placeholder = st.empty()
+    placeholder.markdown(
+        '<div class="thinking-shell"><div class="spinner"></div><div class="thinking-text">Thinking ...</div></div>',
+        unsafe_allow_html=True,
+    )
+    try:
+        yield
+    finally:
+        placeholder.empty()
+
+def build_solution_consulting_messages(user_query, machine_context, book_context, history, max_history=5):
+    sys_prompt = f"""Bạn là kỹ sư tư vấn giải pháp của VPRINT.
+Hãy phân tích yêu cầu sản xuất và tư vấn giải pháp chặt chẽ dựa trên 2 nguồn:
+1. [KHO MÁY VPRINT]
+2. [CẨM NANG NGÀNH IN]
+
+Quy tắc:
+- **QUAN TRỌNG**: Nếu yêu cầu của khách hàng rất chung chung, không rõ ràng (VD: 'tìm máy in', 'tư vấn máy bế'), hãy **BẮT ĐẦU** bằng việc hỏi các câu hỏi để làm rõ nhu cầu (sản phẩm là gì, sản lượng, vật liệu, khổ in...) trước khi đề xuất bất kỳ máy nào. Đừng cố gắng đoán ý và gợi ý máy ngay.
+- Chỉ dùng máy có trong [KHO MÁY VPRINT].
+- TUYỆT ĐỐI KHÔNG ĐỀ XUẤT MÁY KHÔNG CÓ TRONG [KHO MÁY VPRINT]. Nếu cần máy mà kho không có, hãy nói là 'cần trang bị thêm máy X (hiện kho VPRINT chưa có dữ liệu)'.
+- Có thể dùng [CẨM NANG NGÀNH IN] để giải thích lập luận kỹ thuật.
+- Không bịa tên máy, không bịa thông số.
+- Nếu thiếu dữ liệu máy cho một công đoạn, nói rõ là hiện chưa có đủ dữ liệu máy trong kho VPRINT.
+- Nếu câu hỏi hiện tại đang hỏi về tiêu chí chọn máy, dữ liệu đầu vào cần xác định, hoặc các yếu tố ảnh hưởng đến chọn máy:
+  không được nhảy ngay sang đề xuất model máy.
+  Hãy ưu tiên liệt kê các dữ liệu cần xác định, giải thích vì sao từng dữ liệu quan trọng, rồi mới nêu hướng chọn máy.
+  Không lặp lại câu hỏi.
+
+Đầu ra mong muốn:
+1. Phân tích yêu cầu và các ràng buộc kỹ thuật chính.
+2. Đề xuất công nghệ/quy trình phù hợp.
+3. Đề xuất các máy VPRINT phù hợp nhất cho từng công đoạn quan trọng.
+4. Nêu rõ lý do chọn máy dựa trên dữ liệu đã truy hồi.
+5. Nếu còn thiếu thông tin đầu vào, kết thúc bằng 2-3 câu hỏi làm rõ.
+
+[KHO MÁY VPRINT]:
+{machine_context}
+
+[CẨM NANG NGÀNH IN]:
+{book_context}
+"""
+    return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
 
 # ==========================================
 # 3. UTIL FUNCTIONS
@@ -172,11 +898,259 @@ def log_chat_to_gsheet(user_query, bot_response, intent, response_time, tokens, 
         print(f"Lỗi bắn log GSheet: {e}")
         return False
 
+def log_chat_to_gsheet_async(user_query, bot_response, intent, response_time, tokens, model_name):
+    thread = threading.Thread(
+        target=log_chat_to_gsheet,
+        args=(user_query, bot_response, intent, response_time, tokens, model_name),
+        daemon=True,
+    )
+    thread.start()
+
 def get_safe_api_key(key_name="GROQ_API_KEY"):
+    def _clean(v: str):
+        if v is None:
+            return None
+        s = str(v).strip()
+        # Remove surrounding quotes from .env values like "abc"
+        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+            s = s[1:-1].strip()
+        # Handle accidental inline comment in .env, e.g. VALUE  # comment
+        if " #" in s:
+            s = s.split(" #", 1)[0].strip()
+        return s
+
     try:
-        if key_name in st.secrets: return st.secrets[key_name]
+        if key_name in st.secrets:
+            return _clean(st.secrets[key_name])
     except Exception: pass 
-    return os.getenv(key_name)
+    return _clean(os.getenv(key_name))
+
+def detect_booking_lead(text: str):
+    q = normalize_for_match(text)
+    booking_keywords = [
+        "dat lich", "đặt lịch", "xem may", "xem máy", "tu van truc tiep",
+        "tư vấn trực tiếp", "hen gap", "hẹn gặp", "lien he", "liên hệ"
+    ]
+    has_booking_intent = any(k in q for k in booking_keywords)
+
+    email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    phone_match = re.search(r"(?:\+84|0)\d{9,10}", re.sub(r"[^\d\+]", "", text))
+    name_match = re.search(r"(?:ten|tên)\s*[:\-]\s*([^\n,;]+)", text, flags=re.IGNORECASE)
+    if not name_match:
+        # Capture natural introductions: "toi la Tom", "tôi là Tom", "em là Tom", ...
+        name_match = re.search(
+            r"(?:toi|tôi|em|anh|chi|chị)\s+la\s+([A-Za-zÀ-ỹĐđ\s]{2,40})",
+            normalize_for_match(text),
+            flags=re.IGNORECASE,
+        )
+
+    raw_name = name_match.group(1).strip() if name_match else ""
+    payload = {
+        "name": " ".join([w.capitalize() for w in raw_name.split()]) if raw_name else "",
+        "phone": phone_match.group(0) if phone_match else "",
+        "email": email_match.group(0) if email_match else "",
+        "content": text.strip(),
+    }
+    # Trigger when user expresses booking intent and provides at least one contact method
+    is_lead = has_booking_intent and bool(payload["phone"] or payload["email"])
+    return is_lead, payload
+
+def infer_interest_area(text: str, last_docs):
+    q = normalize_for_match(text)
+    if any(k in q for k in ["ctp", "ghi ban", "ban kem"]):
+        return "CTP / chế bản"
+    if any(k in q for k in ["offset"]):
+        return "In offset"
+    if any(k in q for k in ["flexo"]):
+        return "In flexo"
+    if any(k in q for k in ["ky thuat so", "kts", "digital"]):
+        return "In kỹ thuật số"
+    if any(k in q for k in ["bao bi", "carton", "hop giay"]):
+        return "Bao bì / carton"
+
+    if last_docs:
+        names = " ".join([str(d.metadata.get("name", "")).lower() for d in last_docs[:5]])
+        if "ctp" in names or "cron" in names:
+            return "CTP / chế bản"
+        if "flexo" in names:
+            return "In flexo"
+        if "offset" in names:
+            return "In offset"
+        if "digital" in names or "kts" in names:
+            return "In kỹ thuật số"
+    return "Thiết bị in công nghiệp (chưa xác định rõ nhóm)"
+
+def extract_viewed_machines(last_docs):
+    viewed = []
+    for d in (last_docs or [])[:5]:
+        viewed.append(
+            {
+                "name": d.metadata.get("name", ""),
+                "url": d.metadata.get("product_url", ""),
+                "price": d.metadata.get("price", ""),
+            }
+        )
+    return viewed
+
+def track_viewed_machines(docs):
+    if not docs:
+        return
+    seen_urls = {m.get("url", "") for m in st.session_state.viewed_machines}
+    for d in docs:
+        url = d.metadata.get("product_url", "")
+        if url and url in seen_urls:
+            continue
+        st.session_state.viewed_machines.append(
+            {
+                "name": d.metadata.get("name", ""),
+                "url": url,
+                "price": d.metadata.get("price", ""),
+            }
+        )
+        if url:
+            seen_urls.add(url)
+    # Keep recent viewed list bounded
+    st.session_state.viewed_machines = st.session_state.viewed_machines[-10:]
+
+def collect_recent_user_questions(current_query: str, max_items: int = 6):
+    user_msgs = [msg for role, msg in st.session_state.history if role == "user"]
+    if not user_msgs or user_msgs[-1] != current_query:
+        user_msgs.append(current_query)
+    user_msgs = [m.strip() for m in user_msgs if str(m).strip()]
+    return user_msgs[-max_items:]
+
+def build_recent_chat_excerpt(max_turns: int = 8):
+    excerpt = []
+    for role, msg in st.session_state.history[-max_turns:]:
+        role_label = "Khách" if role == "user" else "Bot"
+        clean_msg = re.sub(r"<[^>]+>", "", str(msg)).strip()
+        if clean_msg:
+            excerpt.append(f"{role_label}: {clean_msg[:220]}")
+    return "\n".join(excerpt)
+
+def extract_machine_codes(viewed_machines):
+    codes = []
+    for m in viewed_machines or []:
+        name = str(m.get("name", ""))
+        # Common machine-code pattern (e.g., 60/72, HDI-1200, VP-S54, 26 Models)
+        found = re.findall(r"\b[A-Z0-9]{1,6}(?:[-/][A-Z0-9]{1,8})+\b|\b\d{1,4}(?:/\d{1,4})?\b", name, flags=re.IGNORECASE)
+        if found:
+            codes.extend(found[:2])
+        else:
+            codes.append(name[:40])
+    # Unique while preserving order
+    unique = []
+    seen = set()
+    for c in codes:
+        k = c.lower().strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        unique.append(c.strip())
+    return unique[:8]
+
+def build_interest_summary(recent_user_questions, current_content, interest_area):
+    points = []
+    if interest_area:
+        points.append(f"Lĩnh vực: {interest_area}")
+    if recent_user_questions:
+        points.append(f"Câu hỏi gần đây: {' | '.join(recent_user_questions[-3:])}")
+    if current_content:
+        points.append(f"Yêu cầu hiện tại: {current_content.strip()[:220]}")
+    return " ; ".join(points)
+
+def send_sale_email(payload: dict):
+    smtp_host = get_safe_api_key("SMTP_HOST")
+    smtp_port_raw = get_safe_api_key("SMTP_PORT") or "587"
+    smtp_port = int(str(smtp_port_raw).strip())
+    smtp_user = get_safe_api_key("SMTP_USER")
+    smtp_pass = get_safe_api_key("SMTP_PASS")
+    sale_notify = get_safe_api_key("SALE_NOTIFY_EMAIL")
+    if smtp_pass:
+        smtp_pass = smtp_pass.replace(" ", "").strip()
+
+    if not (smtp_host and smtp_user and smtp_pass and sale_notify):
+        return False, "Missing SMTP config"
+
+    msg = EmailMessage()
+    msg["Subject"] = "[VPRINT AI] Lead dat lich xem may / tu van truc tiep"
+    msg["From"] = smtp_user
+    msg["To"] = sale_notify
+    machine_codes = payload.get("viewed_machine_codes", [])
+    machine_codes_text = ", ".join(machine_codes) if machine_codes else "(chưa có dữ liệu)"
+    interest_summary = payload.get("interest_summary", "")
+
+    plain_body = (
+        "LEAD MOI TU CHATBOT VPRINT AI\n"
+        "=================================\n"
+        f"Ten: {payload.get('name', '')}\n"
+        f"So dien thoai: {payload.get('phone', '')}\n"
+        f"Email: {payload.get('email', '')}\n"
+        f"Linh vuc quan tam: {payload.get('interest_area', '')}\n"
+        f"Ma may khach da xem: {machine_codes_text}\n\n"
+        "Tom tat nhu cau khach:\n"
+        f"{interest_summary}\n"
+    )
+    msg.set_content(plain_body)
+
+    html_body = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; line-height:1.5;">
+        <h3>Lead mới từ chatbot VPRINT AI</h3>
+        <p><b>Tên:</b> {escape(payload.get('name', ''))}<br>
+           <b>SĐT:</b> {escape(payload.get('phone', ''))}<br>
+           <b>Email:</b> {escape(payload.get('email', ''))}<br>
+           <b>Lĩnh vực quan tâm:</b> {escape(payload.get('interest_area', ''))}<br>
+           <b>Mã máy khách đã xem:</b> {escape(machine_codes_text)}</p>
+
+        <p><b>Tóm tắt nhu cầu khách:</b><br>{escape(interest_summary)}</p>
+      </body>
+    </html>
+    """
+    msg.add_alternative(html_body, subtype="html")
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return True, ""
+    except Exception as e:
+        print(f"Loi gui email lead: {e}")
+        return False, str(e)
+
+def send_sale_email_async(payload: dict):
+    thread = threading.Thread(target=send_sale_email, args=(payload,), daemon=True)
+    thread.start()
+
+def build_booking_ack(payload: dict, sent_ok: bool, err: str = "") -> str:
+    customer_name = payload.get("name", "").strip() or "anh/chị"
+    phone = payload.get("phone", "").strip()
+    email = payload.get("email", "").strip()
+    contact_line = []
+    if phone:
+        contact_line.append(f"SĐT: **{phone}**")
+    if email:
+        contact_line.append(f"Email: **{email}**")
+    contact_text = " | ".join(contact_line) if contact_line else "Thông tin liên hệ đã được ghi nhận."
+
+    if sent_ok:
+        return (
+            f"Cảm ơn {customer_name}, VPRINT đã nhận thông tin đặt lịch xem máy của bạn.\n\n"
+            f"{contact_text}\n"
+            "✅ Thông tin đã được chuyển đến nhân viên sales và sẽ liên hệ trực tiếp sớm để xác nhận lịch hẹn.\n\n"
+            "Nếu cần bổ sung khung giờ mong muốn, bạn có thể gửi lại ngay trong khung chat này."
+        )
+
+    return (
+        f"Cảm ơn {customer_name}, VPRINT đã ghi nhận yêu cầu đặt lịch của bạn.\n\n"
+        f"{contact_text}\n"
+        "⚠️ Hệ thống email nội bộ đang lỗi tạm thời nên chưa chuyển tự động cho sales.\n"
+        "Vui lòng gửi lại một lần nữa hoặc để lại khung giờ mong muốn, mình sẽ ưu tiên chuyển tiếp ngay."
+        + (f"\n\n(Chi tiết lỗi: {err})" if err else "")
+    )
 
 def generate_chat_export():
     export_text = "LỊCH SỬ TƯ VẤN - VPRINT SALES AI\n"
@@ -196,11 +1170,51 @@ def stream_response(messages, llm):
             st.session_state.api_tokens += chunk.usage_metadata.get('total_tokens', 0)
         yield chunk.content
 
-def generate_suggestions(llm_router, prompt):
-    res = llm_router.invoke([("system", "Bạn là Kỹ sư Sales VPRINT tinh tế. Hãy tạo câu chuyển tiếp mượt mà."), ("user", prompt)])
-    if hasattr(res, 'usage_metadata') and res.usage_metadata:
-        st.session_state.api_tokens += res.usage_metadata.get('total_tokens', 0)
-    return res.content
+def custom_write_stream(stream_generator):
+    """Renders a stream with a Gemini-style typing cursor for a smoother feel."""
+    placeholder = st.empty()
+    full_response = ""
+    for chunk in stream_generator:
+        if chunk:
+            full_response += chunk
+            placeholder.markdown(full_response + "▌", unsafe_allow_html=True)
+    # Final render without the cursor
+    placeholder.markdown(full_response, unsafe_allow_html=True)
+    return full_response
+
+def summarize_machines_structured(user_query: str, suggested_docs, llm_main):
+    # TỐI ƯU: Thay vì gọi LLM để tóm tắt (tốn rất nhiều token context),
+    # ta sử dụng hàm Regex `build_fallback_machine_summary` đã viết sẵn.
+    # Hàm này trích xuất Description, Features, Specs từ text rất tốt và MIỄN PHÍ token.
+    return [build_fallback_machine_summary(doc) for doc in suggested_docs]
+
+def rerank_machine_candidates(user_query: str, candidate_docs, llm_main, top_k: int = 3):
+    if not candidate_docs:
+        return []
+
+    # TỐI ƯU: Sử dụng thuật toán chấm điểm cục bộ (Local Scoring) thay vì gọi LLM.
+    # Hàm `lexical_match_score` và `score_doc_with_profile` đã có sẵn logic so khớp từ khóa và ngữ cảnh.
+    
+    profile = build_machine_query_profile(user_query, llm_main) # Vẫn dùng LLM nhỏ để trích xuất profile (ít token)
+    scored = []
+    for d in candidate_docs:
+        # Kết hợp điểm Profile (Semantic) và điểm Lexical (Keyword)
+        p_score = score_doc_with_profile(d, profile) if profile else 0
+        l_score = lexical_match_score(user_query, d)
+        total_score = p_score + l_score
+        scored.append((total_score, d))
+    
+    # Sắp xếp giảm dần theo điểm
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in scored[:top_k]]
+
+def is_garbage_response(text: str) -> bool:
+    t = text.lower()
+    if t.count("platemaker") >= 5:
+        return True
+    if len(re.findall(r"platemaker\s*\d+", t)) >= 5:
+        return True
+    return False
 
 def deduplicate_docs(docs):
     seen, unique_docs = set(), []
@@ -215,12 +1229,20 @@ def format_specs_to_table(spec_text):
     try:
         data = json.loads(spec_text)
         if not isinstance(data, dict): return spec_text.replace(r'\n', '\n')
+
+        # Handle flat dictionary (Single Model)
+        if all(not isinstance(v, dict) for v in data.values()):
+            header = "| **Thông số** | **Giá trị** |"
+            separator = "|---|---|"
+            rows = [f"| {k} | {v} |" for k, v in data.items()]
+            return "\n".join([header, separator] + rows)
+
         models = list(data.keys())
-        features = list({k for md in data.values() if isinstance(md, dict) for k in md.keys()})
+        features = sorted(list({k for md in data.values() if isinstance(md, dict) for k in md.keys()}))
         if not features: return spec_text.replace(r'\n', '\n')
         header = "| **Thông số** | " + " | ".join([f"**{m}**" for m in models]) + " |"
         separator = "|---|" + "|".join(["---"] * len(models)) + "|"
-        rows = [f"| {feat} | " + " | ".join([str(data[m].get(feat, "-")) for m in models]) + " |" for feat in features]
+        rows = [f"| {feat} | " + " | ".join([str(data[m].get(feat, "-")) if isinstance(data[m], dict) else "-" for m in models]) + " |" for feat in features]
         return "\n".join([header, separator] + rows)
     except: return spec_text.replace(r'\n', '\n')
 
@@ -229,53 +1251,120 @@ def format_specs_to_table(spec_text):
 # ==========================================
 @st.cache_resource
 def load_system():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    machine_embedder = HuggingFaceEmbeddings(model_name=EMBED_MODEL_MACHINES, model_kwargs={"device": device}, encode_kwargs={"normalize_embeddings": True})
+    openai_api_key = get_safe_api_key("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise ValueError("Không tìm thấy OPENAI_API_KEY để khởi tạo OpenAI Embeddings.")
+
+    machine_embedder = OpenAIEmbeddings(model=EMBED_MODEL_MACHINES, api_key=openai_api_key)
     docs = load_csv_docs(CSV_PATH)
     machine_store = Chroma.from_documents(documents=docs, embedding=machine_embedder, collection_name=COLLECTION_MACHINES)
     vector_retriever = machine_store.as_retriever(search_kwargs={"k": K_VECTOR})
     bm25_retriever = BM25Retriever.from_documents(docs)
     bm25_retriever.k = K_BM25
-    machine_ensemble = EnsembleRetriever(retrievers=[bm25_retriever, vector_retriever], weights=[0.5, 0.5])
 
-    book_embedder = HuggingFaceEmbeddings(model_name=EMBED_MODEL_BOOK, model_kwargs={"device": device}, encode_kwargs={"normalize_embeddings": True})
+    book_embedder = OpenAIEmbeddings(model=EMBED_MODEL_BOOK, api_key=openai_api_key)
     book_store = Chroma(persist_directory=PERSIST_DIR, embedding_function=book_embedder, collection_name=COLLECTION_BOOK)
-    book_retriever = book_store.as_retriever(search_kwargs={"k": 4})
+    book_retriever = book_store.as_retriever(search_kwargs={"k": 8})
 
-    return machine_ensemble, book_retriever, machine_embedder, device
+    return vector_retriever, bm25_retriever, book_retriever, machine_embedder
 
-class RouterDecision:
-    def __init__(self, intent="normal_rag", use_rag=True, reset_focus=False):
-        self.intent = intent
-        self.use_rag = use_rag
-        self.reset_focus = reset_focus
+def hybrid_machine_search(user_query: str, vector_retriever, bm25_retriever, top_k: int, llm_main=None):
+    queries = [normalize_text(user_query)]
+    if llm_main is not None:
+        queries = expand_machine_queries(user_query, llm_main, max_queries=3)
 
-def llm_classify_intent(user_query, llm_router):
-    system_prompt = """Bạn là Chuyên gia phân loại ý định cho VPRINT AI.
-    Gán câu hỏi của khách vào 1 trong các nhãn sau. CHỈ trả về tên nhãn:
-    - find_machine: Tìm mua, danh sách máy, chủng loại máy.
-    - spec_query: Chi tiết kỹ thuật, công suất, kích thước, điện áp.
-    - book_knowledge: Kỹ thuật in, lỗi in, quy trình (chế bản, sau in).
-    - solution_consulting: Tư vấn trọn gói, dây chuyền, setup xưởng, tính toán sản lượng, làm sao để sản xuất...
-    - normal_rag: Thông tin chung (bảo hành, địa chỉ, giao hàng).
-    - direct_chat: Chào hỏi, khen ngợi, xã giao.
-    - out_of_domain: Thời tiết, nấu ăn, chủ đề không liên quan.
+    semantic_docs = []
+    bm25_docs = []
+    for q in queries:
+        semantic_docs.extend(vector_retriever.invoke(q))
+        bm25_docs.extend(bm25_retriever.invoke(q))
 
-    Câu hỏi: "{query}"
-    """
+    rrf_k = 60.0
+    scored = {}
+    for rank, doc in enumerate(semantic_docs, start=1):
+        # Sử dụng row_index làm ID duy nhất để tránh gộp nhầm các máy có mô tả giống nhau
+        doc_id = str(doc.metadata.get("row_index")) if "row_index" in doc.metadata else doc.metadata.get("product_url", doc.page_content[:80])
+        entry = scored.setdefault(doc_id, {"doc": doc, "score": 0.0})
+        entry["score"] += 1.0 / (rrf_k + rank)
+
+    for rank, doc in enumerate(bm25_docs, start=1):
+        doc_id = str(doc.metadata.get("row_index")) if "row_index" in doc.metadata else doc.metadata.get("product_url", doc.page_content[:80])
+        entry = scored.setdefault(doc_id, {"doc": doc, "score": 0.0})
+        entry["score"] += 1.0 / (rrf_k + rank)
+
+    merged = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
+    return [item["doc"] for item in merged[:top_k]]
+
+def build_decision_llm(groq_api_key, fallback_llm=None):
     try:
-        response = llm_router.invoke([("system", system_prompt.format(query=user_query))])
+        if groq_api_key:
+            return ChatGroq(
+                model_name="llama-3.1-8b-instant",
+                temperature=0.0,
+                groq_api_key=groq_api_key,
+            )
+    except Exception:
+        pass
+    return fallback_llm
+
+def llm_classify_intent(user_query, llm_main, history=None):
+    # TỐI ƯU: Kiểm tra nhanh bằng quy tắc trước
+    quick_intent = quick_intent_classify(user_query)
+    if quick_intent:
+        return quick_intent
+
+    recent_history = ""
+    if history:
+        recent_turns = []
+        for role, msg in history[-6:]:
+            role_label = "user" if role == "user" else "assistant"
+            clean_msg = normalize_text(re.sub(r"<[^>]+>", "", str(msg)))[:220]
+            if clean_msg:
+                recent_turns.append(f"{role_label}: {clean_msg}")
+        recent_history = "\n".join(recent_turns)
+
+    system_prompt = """Bạn là bộ phân loại intent cho chatbot VPRINT.
+Chỉ trả về đúng 1 nhãn trong danh sách:
+find_machine,book_knowledge,solution_consulting,direct_chat
+
+Tiêu chí:
+- find_machine: khách hỏi tìm một loại máy cụ thể, có đủ chi tiết để tìm kiếm (VD: 'máy bế hộp carton', 'máy in offset 4 màu khổ nhỏ').
+- book_knowledge: khách hỏi kiến thức ngành in, nguyên lý, quy trình, so sánh công nghệ, thuật ngữ kỹ thuật.
+- solution_consulting: khách mô tả bài toán sản xuất có đơn hàng, vật liệu, kích thước, sản lượng, năng suất, quy trình hoặc nhiều ràng buộc kỹ thuật và cần tư vấn giải pháp/chọn công nghệ/chọn tổ hợp máy.
+- direct_chat: chào hỏi, cảm ơn, trò chuyện thông thường hoặc câu hỏi không cần tra cứu dữ liệu.
+
+Ưu tiên:
+- **QUAN TRỌNG**: Nếu khách hỏi tìm máy chung chung, không rõ ràng (VD: 'tôi cần máy in', 'tư vấn máy bế') và thiếu các thông tin quan trọng (sản lượng, vật liệu, khổ giấy), hãy chọn **solution_consulting** để bot hỏi lại thông tin, không chọn `find_machine`.
+- **QUAN TRỌNG**: Nếu câu hỏi mang tính tư vấn, so sánh lựa chọn (VD: 'nên dùng A hay B', 'chọn loại nào tốt hơn cho sản phẩm X'), hãy chọn **solution_consulting** hoặc **book_knowledge**, ngay cả khi có tên công nghệ/máy. Đừng chọn `find_machine`.
+- Nếu câu hỏi nhắc rõ "máy nào", "dòng máy", "model", "thiết bị", "thông số máy" VÀ có đủ chi tiết thì mới chọn `find_machine`.
+- Nếu câu hỏi là "là gì", "khác nhau", "tại sao", "vai trò", "nguyên lý" trong ngữ cảnh ngành in thì chọn book_knowledge.
+- Nếu câu hỏi có nhiều ràng buộc như sản lượng, vật liệu, khổ in, cấu trúc đơn hàng, công đoạn, workflow, đầu tư dây chuyền, chọn solution_consulting.
+- Nếu câu hiện tại là câu làm rõ như "cần xác định gì", "để chọn máy phù hợp", "cần thông tin gì", "xác định dung lượng sản xuất", thì chọn solution_consulting, không chọn find_machine.
+- QUAN TRỌNG: Nếu câu hiện tại có chủ đề KHÁC BIỆT hoàn toàn với lịch sử (VD: đang hỏi kiến thức in Offset sang tìm máy Bế), hãy ưu tiên phân loại theo CÂU HIỆN TẠI và BỎ QUA lịch sử cũ.
+- Phải xét cả lịch sử hội thoại gần đây, không chỉ nhìn một câu đơn lẻ.
+- Nếu không chắc giữa direct_chat và book_knowledge, ưu tiên direct_chat.
+Chỉ trả về nhãn, không giải thích."""
+    try:
+        short_query = user_query[:INTENT_QUERY_MAX_CHARS]
+        classifier_input = short_query
+        if recent_history:
+            classifier_input = f"Lịch sử gần đây:\n{recent_history}\n\nCâu hiện tại:\n{short_query}"
+        response = llm_main.invoke([("system", system_prompt), ("user", classifier_input)])
         if hasattr(response, 'usage_metadata') and response.usage_metadata:
             st.session_state.api_tokens += response.usage_metadata.get('total_tokens', 0)
         intent = response.content.strip().lower()
-        valid_intents = ["find_machine", "spec_query", "book_knowledge", "solution_consulting", "normal_rag", "direct_chat", "out_of_domain"]
+        valid_intents = ["find_machine", "book_knowledge", "solution_consulting", "direct_chat"]
         for valid in valid_intents:
             if valid in intent: return valid
-        return "normal_rag"
-    except Exception: return "normal_rag"
+        return "direct_chat"
+    except Exception:
+        return "direct_chat"
 
-machine_retriever, book_retriever, sys_embedder, sys_device = load_system()
+try:
+    machine_vector_retriever, machine_bm25_retriever, book_retriever, sys_embedder = load_system()
+except Exception as e:
+    st.error(f"⚠️ Không thể khởi tạo hệ thống retrieval: {e}")
+    st.stop()
 
 # ==========================================
 # 6. UI RENDER (SIDEBAR & MAIN)
@@ -286,8 +1375,13 @@ with st.sidebar:
     
     # Đã thêm GPT-4o vào danh sách lựa chọn
     selected_model = st.selectbox("Chọn Model", [
-        "gpt-4o", 
-        "openai/gpt-oss-20b", 
+        "gpt-4o",
+        "openai/gpt-oss-20b",
+        "gpt-3.5-turbo",
+        
+        
+        
+         
         "qwen/qwen3-32b", 
         "llama-3.1-8b-instant"
     ])
@@ -302,7 +1396,10 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄 Reset Chat", use_container_width=True):
-            st.session_state.history, st.session_state.last_docs, st.session_state.current_suggestions = [], [], []
+            st.session_state.history, st.session_state.last_docs = [], []
+            st.session_state.qa_cache = {}
+            st.session_state.sent_booking_keys = set()
+            st.session_state.viewed_machines = []
             st.session_state.intent_counts = {k: 0 for k in st.session_state.intent_counts}
             st.session_state.api_tokens = 0
             st.session_state.total_session_tokens = 0
@@ -323,245 +1420,229 @@ if len(st.session_state.history) == 0:
 # ==========================================
 # 7. LOGIC XỬ LÝ CHÍNH
 # ==========================================
-user_query = st.chat_input("Nhập câu hỏi hoặc chọn gợi ý...")
-if st.session_state.suggestion_clicked:
-    user_query = st.session_state.suggestion_clicked
-    st.session_state.suggestion_clicked = None 
+user_query = st.chat_input("Nhập câu hỏi...")
 
 if user_query:
     with st.chat_message("user", avatar="👤"): st.markdown(user_query)
     st.session_state.history.append(("user", user_query))
-    st.session_state.current_suggestions = []
     st.session_state.api_tokens = 0 
+
+    # Auto notify sales via email when user sends booking/contact lead info.
+    is_lead, lead_payload = detect_booking_lead(user_query)
+    if is_lead:
+        viewed_machines = st.session_state.viewed_machines or extract_viewed_machines(st.session_state.last_docs)
+        recent_user_questions = collect_recent_user_questions(user_query)
+        interest_area = infer_interest_area(" | ".join(recent_user_questions), st.session_state.last_docs)
+        lead_payload["interest_area"] = interest_area
+        lead_payload["viewed_machine_codes"] = extract_machine_codes(viewed_machines)
+        lead_payload["interest_summary"] = build_interest_summary(recent_user_questions, user_query, interest_area)
+
+        lead_key = make_query_cache_key(
+            f"{lead_payload.get('phone', '')}|{lead_payload.get('email', '')}|{lead_payload.get('content', '')[:120]}"
+        )
+        ok, err = (True, "")
+        if lead_key not in st.session_state.sent_booking_keys:
+            ok, err = send_sale_email(lead_payload)
+            if ok:
+                st.session_state.sent_booking_keys.add(lead_key)
+                st.toast("Đã gửi thông tin đặt lịch cho nhân viên sales.", icon="✅")
+            else:
+                st.toast(f"Gửi email lead thất bại: {err}", icon="⚠️")
+        booking_ack = build_booking_ack(lead_payload, ok, err)
+        with st.chat_message("assistant", avatar="img/logo.png"):
+            st.markdown(booking_ack, unsafe_allow_html=True)
+        st.session_state.history.append(("assistant", booking_ack))
+        st.caption("⏱ Phản hồi: **0.00s** | 🎯 Phân tích: `booking_lead` | 🪙 Token: **0**")
+        st.stop()
+
+    has_context_dependency = is_context_dependent_query(user_query)
+    turn_history = st.session_state.history[:-1] if has_context_dependency else []
+    use_contextual_cache = not has_context_dependency
+    cache_key = make_query_cache_key(user_query)
+    cached_item = st.session_state.qa_cache.get(cache_key) if use_contextual_cache else None
+    if cached_item:
+        cached_answer = cached_item.get("answer", "")
+        cached_intent = cached_item.get("intent", "normal_rag")
+        with st.chat_message("assistant", avatar="img/logo.png"):
+            st.markdown(cached_answer, unsafe_allow_html=True)
+        st.session_state.history.append(("assistant", cached_answer))
+        if cached_intent in st.session_state.intent_counts:
+            st.session_state.intent_counts[cached_intent] += 1
+        st.caption(f"⏱ Phản hồi: **0.00s** | 🎯 Phân tích: `{cached_intent}` | 🪙 Token: **0** | ⚡ Cache hit")
+        st.stop()
 
     # Lấy API Key động dựa trên Model
     groq_api_key = get_safe_api_key("GROQ_API_KEY")
     openai_api_key = get_safe_api_key("OPENAI_API_KEY")
-    
-    if not groq_api_key:
-        st.error("⚠️ Không tìm thấy GROQ_API_KEY để chạy Router.")
-        st.stop()
-        
-    # Setup LLM Router (Luôn dùng Groq Llama cho nhẹ, rẻ và cực nhanh)
-    llm_router = ChatGroq(model_name="llama-3.1-8b-instant", temperature=0.0, groq_api_key=groq_api_key)
 
     # Setup LLM Main (Chuyển đổi linh hoạt giữa OpenAI và Groq)
-    if selected_model == "gpt-4o":
+    if selected_model in ["gpt-4o", "gpt-3.5-turbo"]:
         if not openai_api_key:
             st.error("⚠️ Không tìm thấy OPENAI_API_KEY. Vui lòng thêm vào file .env!")
             st.stop()
-        # Tham số stream_usage=True giúp LangChain đếm token của OpenAI chính xác
-        llm_main = ChatOpenAI(model_name="gpt-4o", temperature=temperature, openai_api_key=openai_api_key, stream_usage=True)
+        llm_main = ChatOpenAI(
+            model_name=selected_model,
+            temperature=temperature,
+            openai_api_key=openai_api_key,
+            stream_usage=True,
+        )
     else:
-        llm_main = ChatGroq(model_name=selected_model, temperature=temperature, groq_api_key=groq_api_key)
+        if not groq_api_key:
+            st.error("⚠️ Không tìm thấy GROQ_API_KEY cho model Groq đã chọn.")
+            st.stop()
+        llm_main = ChatGroq(
+            model_name=selected_model,
+            temperature=temperature,
+            groq_api_key=groq_api_key,
+        )
     
     start = time.perf_counter()
-
-    intent_label = llm_classify_intent(user_query, llm_router)
+    history_limit = get_history_limit_for_model(selected_model)
+    llm_decision = build_decision_llm(groq_api_key, llm_main)
+    intent_label = llm_classify_intent(user_query, llm_decision or llm_main, turn_history)
     decision = RouterDecision(
         intent=intent_label,
-        use_rag=(intent_label not in ["direct_chat", "out_of_domain"]),
+        use_rag=(intent_label in ["find_machine", "book_knowledge", "solution_consulting"]),
         reset_focus=(intent_label == "find_machine")
     )
-    decision = apply_router_guards(user_query, decision) 
-    
-    if decision.reset_focus: st.session_state.last_docs = []
-    if decision.intent in st.session_state.intent_counts: st.session_state.intent_counts[decision.intent] += 1
+    decision = apply_router_guards(user_query, decision)
+
+    if decision.reset_focus:
+        st.session_state.last_docs = []
+    if decision.intent in st.session_state.intent_counts:
+        st.session_state.intent_counts[decision.intent] += 1
 
     try:
         raw_answer = ""
-        if decision.use_rag:
-            if decision.intent == "book_knowledge":
-                with st.spinner("📚 Đang tra cứu cẩm nang ngành in..."): 
-                    docs = book_retriever.invoke(user_query)
-                context = format_book_context(docs)
-                messages = build_book_rag_messages(user_query, context, st.session_state.history, MAX_HISTORY)
+        if decision.intent == "book_knowledge":
+            with thinking_indicator():
+                # NÂNG CẤP: Sử dụng RRF Retrieval để lấy kiến thức chính xác hơn,
+                # tránh LLM bịa thông tin khi context rỗng.
+                docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=10)
+            
+            if not docs:
+                # FALLBACK: Nếu không tìm thấy tài liệu trong cẩm nang, dùng kiến thức chung của LLM
+                messages = build_general_knowledge_fallback_messages(user_query, turn_history, history_limit)
                 with st.chat_message("assistant", avatar="img/logo.png"):
-                    raw_answer = st.write_stream(stream_response(messages, llm_main))
-            
+                    raw_answer = custom_write_stream(stream_response(messages, llm_main))
             else:
-                with st.spinner("🔍 Đang lục tìm kho máy móc VPRINT..."):
-                    fused_docs = machine_retriever.invoke(user_query)
-                    filtered_docs = deduplicate_docs(fused_docs)[:K_FINAL + 3] 
-                context = format_context(filtered_docs)
+                # RAG BÌNH THƯỜNG: Nếu có tài liệu
+                context = format_book_context(docs)
+                messages = build_book_rag_messages(user_query, context, turn_history, history_limit)
+                with st.chat_message("assistant", avatar="img/logo.png"):
+                    raw_answer = custom_write_stream(stream_response(messages, llm_main))
 
-                if decision.intent == "find_machine":
-                    suggested_docs = filtered_docs[:3]
-                    if not suggested_docs: 
-                        raw_answer = "Xin lỗi, tôi không tìm thấy máy phù hợp."
-                        with st.chat_message("assistant", avatar="img/logo.png"): 
-                            st.markdown(raw_answer, unsafe_allow_html=True)
-                    else:
-                        raw_answer = "👋 Dựa trên yêu cầu, đây là các dòng máy có thông số phù hợp nhất:\n\n"
-                        expert_context = ""
-                        for i, doc in enumerate(suggested_docs):
-                            raw_content = doc.page_content[:800] 
-                            expert_context += f"MÁY SỐ {i+1}:\n{raw_content}\n\n"
-                            
-                        sys_prompt = f"""Bạn là Kỹ sư Trưởng VPRINT. Khách hàng là chuyên gia kỹ thuật đang tìm máy.
-                        Nhiệm vụ: Đọc thông số thô của {len(suggested_docs)} máy dưới đây và tóm tắt thành 4 ý. 
-                        TUYỆT ĐỐI KHÔNG BỊA ĐẶT. Ngắn gọn, súc tích.
-                        
-                        FORMAT BẮT BUỘC BẰNG MARKDOWN CỦA TỪNG MÁY:
-                        - **Mô tả:** [1 câu tóm tắt chức năng]
-                        - **Tốc độ/Hiệu suất:** [Thông số tốc độ]
-                        - **Công nghệ:** [Các công nghệ đáng chú ý]
-                        - **Điểm ưu việt:** [Đặc điểm nổi bật]
-                        
-                        LƯU Ý: Giữa mỗi máy BẮT BUỘC phải có ký hiệu `|||` để phân cách. Không lặp lại tên máy.
-                        DỮ LIỆU THÔ:
-                        {expert_context}
-                        """
-                        
-                        with st.spinner("🧠 Đang phân tích thông số kỹ thuật chuyên sâu..."):
-                            usp_response = llm_main.invoke([("system", sys_prompt), ("user", user_query)])
-                            usp_text = usp_response.content
-                            if hasattr(usp_response, 'usage_metadata') and usp_response.usage_metadata:
-                                st.session_state.api_tokens += usp_response.usage_metadata.get('total_tokens', 0)
-                                
-                        usp_blocks = [block.strip() for block in usp_text.split('|||') if block.strip()]
-                        
-                        with st.chat_message("assistant", avatar="img/logo.png"):
-                            display_container = st.empty()
-                            
-                            for i, doc in enumerate(suggested_docs):
-                                name = doc.metadata.get("name", f"Sản phẩm {i+1}")
-                                url = doc.metadata.get("product_url", "")
-                                imgs = parse_images(doc.metadata.get("images", ""))
-                                
-                                raw_answer += f"### 🏆 Top {i+1}: **[{name}]({url})**\n"
-                                if imgs: 
-                                    img_html = "".join([f'<img src="{img}" style="height:140px;margin-right:8px;border-radius:8px;border:1px solid #ddd;object-fit:contain;">' for img in imgs[:3]])
-                                    raw_answer += f"<div>{img_html}</div><br>\n\n"
-                                
-                                try: raw_answer += f"{usp_blocks[i]}\n\n"
-                                except IndexError: raw_answer += "- Đang cập nhật tóm tắt thông số...\n\n"
-                                    
-                                raw_answer += "---\n\n"
-                            
-                            # CÂU DẪN DẮT + GỢI Ý ĐÃ ĐƯỢC TỐI ƯU
-                            sug_prompt = f"""Khách vừa hỏi: '{user_query}'.
-                            Nhiệm vụ: Viết 1 câu dẫn dắt thật tự nhiên tóm tắt 1 điểm đáng chú ý nhất của các máy vừa tìm được để nối tiếp câu chuyện, sau đó đưa ra 3 câu hỏi ngắn để khách đi sâu hơn.
-                            TUYỆT ĐỐI KHÔNG dùng tiêu đề (như "Gợi ý:", "Có thể bạn quan tâm:"), KHÔNG dùng dấu ngoặc vuông.
-                            
-                            Format chuẩn BẮT BUỘC:
-                            [1 câu dẫn dắt tự nhiên]
-                            - [Câu hỏi 1]?
-                            - [Câu hỏi 2]?
-                            - [Câu hỏi 3]?
-                            """
-                            llm_sug = generate_suggestions(llm_router, sug_prompt) 
-                            raw_answer += f"{llm_sug}"
-                            
-                            display_container.markdown(raw_answer, unsafe_allow_html=True)
-                            
-                        st.session_state.last_docs = suggested_docs
+        elif decision.intent == "solution_consulting":
+            with thinking_indicator():
+                machine_docs = hybrid_machine_search(
+                    user_query,
+                    machine_vector_retriever,
+                    machine_bm25_retriever,
+                    8,
+                    llm_main,
+                )
+                machine_docs = deduplicate_docs(machine_docs)[:6]
+                book_docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=4)
 
-                elif decision.intent == "spec_query":
-                    best_doc = st.session_state.last_docs[0] if st.session_state.last_docs else (filtered_docs[0] if filtered_docs else None)
-                    
-                    if best_doc:
-                        sys_prompt = f"""Bạn là Kỹ sư Tư vấn Máy móc VPRINT.
-                        Khách hàng hỏi: '{user_query}'
-                        Hệ thống tìm thấy máy phù hợp nhất: **{best_doc.metadata.get('name')}**
-                        Chi tiết thông số: {best_doc.page_content}
-                        
-                        Nhiệm vụ:
-                        1. Trả lời TRỰC TIẾP câu hỏi. KHÔNG BỊA ĐẶT.
-                        2. NẾU khách hỏi theo tên gọi khác mà trong thông số có đề cập đến chi tiết đó, hãy GIẢI THÍCH RÕ để khách hiểu.
-                        3. Trình bày thông số kỹ thuật dưới dạng Bảng (Markdown Table) đẹp mắt.
-                        """
-                        messages = [("system", sys_prompt), ("user", user_query)]
-                        
-                        with st.chat_message("assistant", avatar="img/logo.png"):
-                            raw_answer = st.write_stream(stream_response(messages, llm_main))
-                            
-                        # CÂU DẪN DẮT + GỢI Ý ĐÃ ĐƯỢC TỐI ƯU
-                        sug_prompt = f"""Khách vừa xem thông số máy {best_doc.metadata.get('name')}. 
-                        Nhiệm vụ: Viết 1 câu dẫn dắt thật tự nhiên tóm tắt 1 điểm đáng chú ý nhất của máy này để nối tiếp, sau đó đưa ra 3 câu hỏi ngắn (như hỏi giá, bảo hành, so sánh).
-                        TUYỆT ĐỐI KHÔNG dùng tiêu đề, KHÔNG dùng dấu ngoặc vuông.
-                        
-                        Format chuẩn BẮT BUỘC:
-                        [1 câu dẫn dắt tự nhiên]
-                        - [Câu hỏi 1]?
-                        - [Câu hỏi 2]?
-                        - [Câu hỏi 3]?
-                        """
-                        llm_sug = generate_suggestions(llm_router, sug_prompt) 
-                        raw_answer += f"\n\n{llm_sug}"
-                        
-                    else:
-                        error_msg = f"Xin lỗi, hiện tại kho dữ liệu VPRINT không có dòng máy đáp ứng yêu cầu '{user_query}'."
-                        with st.chat_message("assistant", avatar="img/logo.png"):
-                            st.markdown(error_msg)
-                            
+            machine_context = format_context(machine_docs)
+            book_context = format_book_context(book_docs)
+            messages = build_solution_consulting_messages(
+                user_query,
+                machine_context,
+                book_context,
+                turn_history,
+                history_limit,
+            )
+            with st.chat_message("assistant", avatar="img/logo.png"):
+                raw_answer = custom_write_stream(stream_response(messages, llm_main))
+            st.session_state.last_docs = machine_docs
+            track_viewed_machines(machine_docs[:3])
 
-                elif decision.intent == "solution_consulting":
-                    suggested_docs = filtered_docs[:8] 
-                    context = format_context(suggested_docs)
-                    
-                    # SYSTEM PROMPT ĐÃ CẬP NHẬT HOÀN CHỈNH CHO CÂU DẪN DẮT
-                    sys_prompt = f"""Bạn là Kỹ sư Trưởng Tư vấn Giải pháp của VPRINT - chuyên gia cấp cao về hệ thống in ấn và sản xuất bao bì.
+        elif decision.intent == "find_machine":
+            with thinking_indicator():
+                # Xử lý tham chiếu: Nếu đang hỏi tiếp về máy cũ (VD: "Máy này...") -> Gắn tên máy vào query
+                search_query = user_query
+                if has_context_dependency and st.session_state.last_docs:
+                    last_machine_name = st.session_state.last_docs[0].metadata.get("name", "")
+                    if last_machine_name:
+                        # Chỉ bổ sung ngữ cảnh cho Search, không đổi user_query hiển thị
+                        search_query = f"{user_query} ({last_machine_name})"
 
-                    QUYỀN HẠN VÀ RÀNG BUỘC (ĐỌC KỸ BẮT BUỘC TUÂN THỦ):
-                    1. **Về Tư vấn Kỹ thuật & Quy trình (ĐƯỢC TỰ DO):** Bạn ĐƯỢC PHÉP sử dụng toàn bộ tri thức chuyên sâu sẵn có về ngành in (thuật ngữ, kỹ thuật Offset/Flexo/Digital, công thức tính toán...) để vạch ra giải pháp tối ưu nhất.
-                    2. **Về Đề xuất Máy móc (RÀNG BUỘC NGHIÊM NGẶT):** Khi ráp thiết bị vào quy trình, CHỈ ĐƯỢC PHÉP sử dụng các dòng máy có trong [DỮ LIỆU KHO MÁY VPRINT] bên dưới. TUYỆT ĐỐI KHÔNG tự bịa tên máy. NẾU THIẾU máy cho công đoạn nào, hãy ghi: "Hiện VPRINT chưa có sẵn dữ liệu máy cho công đoạn này...".
+                filtered_docs = hybrid_machine_search(
+                    search_query,
+                    machine_vector_retriever,
+                    machine_bm25_retriever,
+                    SEARCH_POOL_K,
+                    llm_main,
+                )
+                filtered_docs = deduplicate_docs(filtered_docs)[:SEARCH_POOL_K]
 
-                    HÃY SUY LUẬN TỪNG BƯỚC:
-                    1. **Phân tích Bài toán**: Dùng tri thức phân tích yêu cầu. Tự tính toán tốc độ/công suất yêu cầu.
-                    2. **Thiết kế Quy trình & Công nghệ**: Vẽ ra các công đoạn. Giải thích ngắn gọn tại sao chọn công nghệ đó.
-                    3. **Khớp nối Thiết bị VPRINT**: Nhặt máy móc phù hợp từ kho VPRINT để điền vào các công đoạn ở bước 2.
-                    4. **Trình bày**: Lập 1 Bảng Tóm tắt Dây chuyền rõ ràng.
-                    5. **Gợi ý Câu hỏi tiếp nối (QUAN TRỌNG)**: Ở phần dưới cùng, BẮT BUỘC viết 1 câu dẫn dắt thật tự nhiên tóm tắt 1 điểm mấu chốt của dây chuyền bạn vừa thiết kế, sau đó liệt kê 3 câu hỏi ngắn để khách đi sâu hơn. 
-                    TUYỆT ĐỐI KHÔNG ghi tiêu đề (như "Gợi ý:", "Có thể bạn quan tâm:"), KHÔNG dùng dấu ngoặc vuông.
-                    
-                    Format chuẩn BẮT BUỘC:
-                    [1 câu tóm tắt nối tiếp tự nhiên, VD: 'Với tổng công suất 15Kw và tốc độ 100 cái/phút của dây chuyền trên, bạn có muốn:']
-                    - Xem báo giá chi tiết dây chuyền này?
-                    - Tìm hiểu cách bố trí mặt bằng xưởng?
-                    - So sánh với phương án khác?
+            suggested_docs = rerank_machine_candidates(
+                user_query=user_query,
+                candidate_docs=filtered_docs,
+                llm_main=llm_main,
+                top_k=3,
+            )
 
-                    [DỮ LIỆU KHO MÁY VPRINT]:
-                    {context}
-                    """
-                    
-                    opt_history = get_optimized_history(st.session_state.history, MAX_HISTORY)
-                    messages = [("system", sys_prompt)] + opt_history + [("user", f"Yêu cầu khách hàng: '{user_query}'")]
-                    
-                    with st.chat_message("assistant", avatar="img/logo.png"):
-                        raw_answer = st.write_stream(stream_response(messages, llm_main))
-                
-                else: # normal_rag
-                    messages = build_rag_messages(user_query, context, st.session_state.history, MAX_HISTORY)
-                    with st.chat_message("assistant", avatar="img/logo.png"): 
-                        raw_answer = st.write_stream(stream_response(messages, llm_main))
+            if not suggested_docs:
+                raw_answer = "Xin lỗi, tôi chưa tìm thấy máy phù hợp trong kho dữ liệu hiện tại của VPRINT."
+                with st.chat_message("assistant", avatar="img/logo.png"):
+                    st.markdown(raw_answer, unsafe_allow_html=True)
+            else:
+                track_viewed_machines(suggested_docs)
+                raw_answer = "👋 Dựa trên yêu cầu, đây là các dòng máy phù hợp nhất:\n\n"
 
-        elif decision.intent == "out_of_domain":
-            # FALLBACK PROMPT ĐÃ CẬP NHẬT CHO CÂU DẪN DẮT
-            fallback_prompt = f"""Bạn là VPRINT AI - Chuyên gia tư vấn máy móc ngành in và bao bì.
-            Khách hỏi: '{user_query}' (KHÔNG LIÊN QUAN chuyên môn).
-            
-            Nhiệm vụ:
-            1. Từ chối lịch sự, vui vẻ (dưới 40 chữ).
-            2. Ở dưới cùng, BẮT BUỘC viết 1 câu dẫn dắt chuyển hướng mượt mà quay lại việc tìm máy móc, kèm 3 câu hỏi tùy chọn.
-            TUYỆT ĐỐI KHÔNG dùng tiêu đề, KHÔNG dùng ngoặc vuông.
-            
-            Format chuẩn:
-            [1 câu dẫn dắt tự nhiên, VD: 'Thay vì chủ đề này, tôi có thể tư vấn cho bạn về các dòng máy công nghiệp. Bạn đang quan tâm đến:']
-            - Máy in Offset hay Flexo?
-            - Dây chuyền làm ly giấy?
-            - Thiết bị bế hộp tự động?
-            """
-            messages = [("system", fallback_prompt)]
-            with st.chat_message("assistant", avatar="img/logo.png"): 
-                raw_answer = st.write_stream(stream_response(messages, llm_main))
+                is_spec_request = any(k in normalize_for_match(user_query) for k in ["thong so", "cau hinh", "spec", "ky thuat", "chi tiet"])
 
-        else: # direct_chat
-            messages = build_direct_messages(user_query, st.session_state.history, MAX_HISTORY)
-            with st.chat_message("assistant", avatar="img/logo.png"): 
-                raw_answer = st.write_stream(stream_response(messages, llm_main))
+                with thinking_indicator():
+                    machine_summaries = summarize_machines_structured(user_query, suggested_docs, llm_main)
+
+                with st.chat_message("assistant", avatar="img/logo.png"):
+                    display_container = st.empty()
+                    for i, doc in enumerate(suggested_docs):
+                        name = doc.metadata.get("name", f"Sản phẩm {i+1}")
+                        url = doc.metadata.get("product_url", "")
+                        imgs = parse_images(doc.metadata.get("images", ""))
+                        raw_answer += f"### 🏆 Top {i+1}: **[{name}]({url})**\n"
+                        if imgs:
+                            img_html = "".join(
+                                [f'<img src="{img}" style="height:140px;margin-right:8px;border-radius:8px;border:1px solid #ddd;object-fit:contain;">' for img in imgs[:3]]
+                            )
+                            raw_answer += f"<div>{img_html}</div><br>\n\n"
+
+                        if i < len(machine_summaries):
+                            s = machine_summaries[i]
+                            raw_answer += (
+                                f"- **Mô tả:** {s.description}\n"
+                                f"- **Tốc độ/Hiệu suất:** {s.performance}\n"
+                                f"- **Công nghệ:** {s.technology}\n"
+                                f"- **Điểm ưu việt:** {s.advantage}\n\n"
+                            )
+
+                        if is_spec_request:
+                            specs_txt = _extract_field(doc.page_content, "Specifications")
+                            if specs_txt:
+                                table = format_specs_to_table(specs_txt)
+                                if table:
+                                    raw_answer += f"\n**📋 Thông số kỹ thuật:**\n\n{table}\n\n"
+
+                        raw_answer += "---\n\n"
+                        # Cập nhật UI ngay lập tức sau mỗi máy để người dùng không phải chờ
+                        display_container.markdown(raw_answer, unsafe_allow_html=True)
+                st.session_state.last_docs = suggested_docs
+
+        else:
+            with thinking_indicator():
+                messages = build_direct_messages(user_query, turn_history, history_limit)
+            with st.chat_message("assistant", avatar="img/logo.png"):
+                raw_answer = custom_write_stream(stream_response(messages, llm_main))
 
         if raw_answer:
+            if not raw_answer.startswith("⚠️"):
+                st.session_state.qa_cache[cache_key] = {
+                    "answer": raw_answer,
+                    "intent": decision.intent,
+                }
             st.session_state.history.append(("assistant", raw_answer))
             
             tokens_used = st.session_state.api_tokens
@@ -570,12 +1651,12 @@ if user_query:
             st.session_state.total_session_tokens += tokens_used
             process_time = time.perf_counter() - start
             
-            is_logged = log_chat_to_gsheet(user_query, raw_answer, decision.intent, process_time, tokens_used, selected_model)
+            log_chat_to_gsheet_async(user_query, raw_answer, decision.intent, process_time, tokens_used, selected_model)
 
     except Exception as e:
         error_msg = f"⚠️ Hệ thống AI đang bận. Vui lòng thử lại! (Chi tiết: {str(e)})"
         with st.chat_message("assistant", avatar="img/logo.png"): st.markdown(error_msg)
         st.session_state.history.append(("assistant", error_msg))
-        log_chat_to_gsheet(user_query, error_msg, decision.intent, 0, 0, selected_model)
+        log_chat_to_gsheet_async(user_query, error_msg, decision.intent, 0, 0, selected_model)
 
     st.caption(f"⏱ Phản hồi: **{round(time.perf_counter() - start, 2)}s** | 🎯 Phân tích: `{decision.intent}` | 🪙 Token: **{st.session_state.api_tokens}**")

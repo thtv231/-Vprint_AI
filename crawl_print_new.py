@@ -61,109 +61,181 @@ def parse_list(html, page):
 # ⭐ PRODUCT IMAGE PARSER
 # chỉ lấy ảnh trong .wap_pro .zoom_slick
 # =====================================================
-def parse_product_images(soup):
+# def parse_product_images(soup):
 
-    images = set()
+#     images = set()
 
-    container = soup.select_one(".wap_pro .zoom_slick")
+#     container = soup.select_one(".wap_pro .zoom_slick")
 
-    if not container:
-        return []
+#     if not container:
+#         return []
 
-    for img in container.select("img"):
+#     for img in container.select("img"):
 
-        src = img.get("src")
+#         src = img.get("src")
 
-        if not src:
-            continue
+#         if not src:
+#             continue
 
-        src_lower = src.lower()
+#         src_lower = src.lower()
 
-        # bỏ thumbnail
-        if "thumb" in src_lower or "100x80" in src_lower:
-            continue
+#         # bỏ thumbnail
+#         if "thumb" in src_lower or "100x80" in src_lower:
+#             continue
 
-        # chỉ lấy ảnh sản phẩm
-        if (
-            "upload/sanpham" in src_lower
-            or "upload/hinhthem" in src_lower
-            or "upload/images" in src_lower
-        ):
+#         # chỉ lấy ảnh sản phẩm
+#         if (
+#             "upload/sanpham" in src_lower
+#             or "upload/hinhthem" in src_lower
+#             or "upload/images" in src_lower
+#         ):
 
-            images.add(urljoin(BASE_URL, src))
+#             images.add(urljoin(BASE_URL, src))
 
-    return sorted(images)
+#     return sorted(images)
+
+
+# # =====================================================
+# # SPECS PARSER
+# # =====================================================
+# def parse_specs(soup):
+
+#     container = soup.select_one(".tab_2") or soup
+
+#     specs = {}
+
+#     for table in container.select("table"):
+
+#         rows = table.select("tr")
+
+#         if not rows:
+#             continue
+
+#         headers = [
+#             clean_text(c.get_text(" ", strip=True))
+#             for c in rows[0].find_all(["td", "th"])
+#         ]
+
+#         # ===== 2 columns =====
+#         if len(headers) == 2:
+
+#             for r in rows:
+
+#                 td = r.find_all("td")
+
+#                 if len(td) != 2:
+#                     continue
+
+#                 k = clean_text(td[0].get_text())
+#                 v = clean_text(td[1].get_text())
+
+#                 if k and v:
+#                     specs[k] = v
+
+#         # ===== multi column =====
+#         elif len(headers) > 2:
+
+#             models = headers[1:]
+#             model_specs = {m: {} for m in models}
+
+#             for r in rows[1:]:
+
+#                 cols = r.find_all("td")
+
+#                 if len(cols) != len(headers):
+#                     continue
+
+#                 key = clean_text(cols[0].get_text())
+
+#                 for i, m in enumerate(models):
+
+#                     val = clean_text(cols[i+1].get_text())
+
+#                     if val:
+#                         model_specs[m][key] = val
+
+#             specs.update(model_specs)
+
+#     # UL specs
+#     for li in container.select("li"):
+
+#         t = clean_text(li.get_text())
+
+#         if ":" in t:
+#             k, v = t.split(":", 1)
+#             specs[clean_text(k)] = clean_text(v)
+
+#     return specs
 
 
 # =====================================================
-# SPECS PARSER
+# SPECS PARSER (PHIÊN BẢN TỐI ƯU TOÀN DIỆN)
 # =====================================================
 def parse_specs(soup):
 
     container = soup.select_one(".tab_2") or soup
-
     specs = {}
 
     for table in container.select("table"):
-
         rows = table.select("tr")
-
         if not rows:
             continue
 
-        headers = [
-            clean_text(c.get_text(" ", strip=True))
-            for c in rows[0].find_all(["td", "th"])
-        ]
+        parsed_rows = []
+        for r in rows:
+            cells = []
+            # Lấy cả thẻ th và td để không bị sót bất kỳ cấu trúc bảng nào
+            for c in r.find_all(["td", "th"]):
+                
+                # Biến các thẻ <br> thành dấu " | " để text không bị dính vào nhau
+                for br in c.find_all("br"):
+                    br.replace_with(" | ")
+                    
+                text = clean_text(c.get_text(" ", strip=True))
+                if text:
+                    cells.append(text)
 
-        # ===== 2 columns =====
-        if len(headers) == 2:
+            if cells:
+                parsed_rows.append(cells)
 
-            for r in rows:
+        if not parsed_rows:
+            continue
 
-                td = r.find_all("td")
+        max_cols = max(len(r) for r in parsed_rows)
 
-                if len(td) != 2:
-                    continue
+        # ===== BẢNG SO SÁNH NHIỀU MODEL =====
+        if max_cols > 2:
+            header_row = next((r for r in parsed_rows if len(r) == max_cols), None)
+            
+            if header_row:
+                models = header_row[1:]
+                model_specs = {m: {} for m in models if m}
 
-                k = clean_text(td[0].get_text())
-                v = clean_text(td[1].get_text())
+                for r in parsed_rows:
+                    if len(r) == max_cols and r != header_row:
+                        key = r[0]
+                        for i, m in enumerate(models):
+                            if m and i + 1 < len(r):
+                                model_specs[m][key] = r[i+1]
+                    elif len(r) == 2:
+                        specs[r[0]] = r[1]
+                
+                specs.update(model_specs)
 
-                if k and v:
-                    specs[k] = v
+        # ===== BẢNG THÔNG SỐ CƠ BẢN (Key - Value) =====
+        else:
+            for r in parsed_rows:
+                if len(r) == 2:
+                    specs[r[0]] = r[1]
 
-        # ===== multi column =====
-        elif len(headers) > 2:
-
-            models = headers[1:]
-            model_specs = {m: {} for m in models}
-
-            for r in rows[1:]:
-
-                cols = r.find_all("td")
-
-                if len(cols) != len(headers):
-                    continue
-
-                key = clean_text(cols[0].get_text())
-
-                for i, m in enumerate(models):
-
-                    val = clean_text(cols[i+1].get_text())
-
-                    if val:
-                        model_specs[m][key] = val
-
-            specs.update(model_specs)
-
-    # UL specs
+    # Xử lý thêm các thông số nằm ngoài bảng (dạng UL/LI)
     for li in container.select("li"):
-
         t = clean_text(li.get_text())
-
         if ":" in t:
             k, v = t.split(":", 1)
-            specs[clean_text(k)] = clean_text(v)
+            k_clean = clean_text(k)
+            if k_clean and k_clean not in specs:
+                specs[k_clean] = clean_text(v)
 
     return specs
 

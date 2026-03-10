@@ -18,3 +18,4 @@ google-auth
 plotly
 pytz
 langchain-openai
+langgraph
