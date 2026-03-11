@@ -25,3 +25,5 @@ langchain-huggingface
 langchain-classic
 langgraph
 rank_bm25
+torch
+sentence-transformers
