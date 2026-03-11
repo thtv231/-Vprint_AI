@@ -21,7 +21,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 import pytz 
 from langchain_chroma import Chroma
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -255,13 +254,15 @@ def parse_consulting_request(user_query: str, turn_history: list, llm_main) -> C
     prompt = f"""Bạn là Kỹ sư trưởng thiết kế dây chuyền sản xuất ngành in bao bì.
     
     Lịch sử chat: {history_text}
-    Yêu cầu hiện tại: "{user_query}"
+    Yêu cầu hiện tại của khách: "{user_query}"
     
     Quy tắc TỐI QUAN TRỌNG:
-    1. Xác định đúng Định dạng vật liệu (material_format). Các loại hộp giấy (Ivory, Duplex, Bristol) LUÔN LUÔN là "Tờ rời" (Sheet-fed), không bao giờ dùng máy bế cuộn.
-    2. Xác định Quy mô (production_scale). Nếu có chữ "cao cấp", "dây chuyền", "nhà máy", ưu tiên chọn máy "công nghiệp", "tự động" (Automatic).
-    3. Gia công sau in (Finishing): Nếu sản phẩm là hộp mỹ phẩm, hộp cao cấp, BẮT BUỘC thêm công đoạn Ép kim (Hot foil stamping) hoặc UV định hình (Spot UV) vào danh sách quy trình.
-    4. Từ khóa tìm kiếm (search_keywords) phải đính kèm đặc tính. Đừng chỉ ghi "máy bế", hãy ghi "máy bế phẳng tự động tờ rời". Đừng ghi "máy cán màng", hãy ghi "máy cán màng nhiệt tự động công nghiệp".
+    1. KẾ THỪA NGỮ CẢNH: Nếu "Yêu cầu hiện tại" là một câu nói lửng hoặc câu tinh chỉnh (VD: "loại có thể đựng nước nóng", "kích thước nhỏ hơn"), bạn BẮT BUỘC phải đối chiếu với "Lịch sử chat" để biết khách đang nói về sản phẩm/máy móc nào. 
+       - Ví dụ: Lịch sử là "Máy làm ly giấy", yêu cầu hiện tại là "loại đựng nước nóng" -> Bạn phải hiểu là khách đang tìm "máy làm ly giấy đựng nước nóng". KHÔNG ĐƯỢC tự suy diễn sang máy in.
+    2. Xác định đúng Định dạng vật liệu (material_format). Các loại hộp giấy (Ivory, Duplex, Bristol) LUÔN LUÔN là "Tờ rời" (Sheet-fed), không bao giờ dùng máy bế cuộn.
+    3. Xác định Quy mô (production_scale). Nếu có chữ "cao cấp", "dây chuyền", "nhà máy", ưu tiên chọn máy "công nghiệp", "tự động" (Automatic).
+    4. Gia công sau in (Finishing): Nếu sản phẩm là hộp mỹ phẩm, hộp cao cấp, BẮT BUỘC thêm công đoạn Ép kim (Hot foil stamping) hoặc UV định hình (Spot UV) vào danh sách quy trình.
+    5. Từ khóa tìm kiếm (search_keywords): Phải gộp cả thông tin từ Lịch sử và Yêu cầu hiện tại thành một cụm từ khóa hoàn chỉnh. (VD: "máy làm ly giấy tự động tráng màng PE chịu nhiệt"). Ngay cả khi yêu cầu chưa rõ ràng (is_clear = False), BẮT BUỘC phải phỏng đoán 1-2 từ khóa chung chung nhất để hệ thống có thể rút ra 1-2 máy ví dụ.
     """
     try:
         # GPT-4o, GPT-3.5 hoặc Llama 3.1 trên Groq đều hỗ trợ structured output rất tốt
@@ -338,6 +339,61 @@ def extract_labeled_value(text: str, label: str) -> str:
     pattern = rf"{re.escape(label)}:\s*(.*?)(?=\s*[A-Za-z ]+:|$)"
     m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
     return normalize_text(m.group(1)) if m else ""
+
+def format_specs_to_json_table(specs_str: str) -> str:
+    """Chuyển đổi chuỗi JSON thông số thành bảng Markdown"""
+    if not specs_str or specs_str.strip() in ["", "{}", "None"]:
+        return "*(Đang cập nhật)*"
+        
+    try:
+        # Cố gắng đọc chuỗi thành Dictionary
+        data = json.loads(specs_str)
+        if not data:
+            return "*(Đang cập nhật)*"
+
+        # Kiểm tra xem có phải JSON lồng nhau (Multiple Models) không
+        # Ví dụ: {"INVICTA 430": {"Speed": "220"}, "INVICTA 630": {"Speed": "200"}}
+        is_nested = any(isinstance(v, dict) for v in data.values())
+
+        if is_nested:
+            # Lấy danh sách các model và tất cả các thông số
+            models = [str(k) for k in data.keys() if str(k).strip() != ""]
+            if not models: return "*(Đang cập nhật)*"
+            
+            all_params = []
+            for model in models:
+                if isinstance(data[model], dict):
+                    for k in data[model].keys():
+                        if k not in all_params:
+                            all_params.append(k)
+            
+            # Khởi tạo Header của bảng
+            header = "| Thông số | " + " | ".join(models) + " |"
+            separator = "|---| " + " | ".join(["---" for _ in models]) + " |"
+            
+            # Điền dữ liệu vào từng hàng
+            rows = []
+            for param in all_params:
+                row = f"| **{param}** |"
+                for model in models:
+                    val = data[model].get(param, "-") if isinstance(data[model], dict) else "-"
+                    row += f" {val} |"
+                rows.append(row)
+                
+            return "\n".join([header, separator] + rows)
+            
+        else:
+            # JSON phẳng (Single Model)
+            # Ví dụ: {"Tốc độ": "220", "Khổ giấy": "A4"}
+            header = "| Thông số | Giá trị |"
+            separator = "|---|---|"
+            rows = [f"| **{k}** | {v} |" for k, v in data.items()]
+            return "\n".join([header, separator] + rows)
+
+    except json.JSONDecodeError:
+        # Fallback: Nếu lỗi parse JSON, cắt gọn và làm sạch chuỗi thô
+        clean_str = specs_str.replace("{", "").replace("}", "").replace('"', '').replace(":", " - ")
+        return f"*(Dữ liệu thô)*: {clean_str[:250]}..."
 
 def derive_machine_metadata(row: pd.Series):
     text = normalize_for_match(
@@ -447,7 +503,7 @@ Nhiệm vụ của bạn là giải đáp các câu hỏi kỹ thuật ngành in
 - 🎯 Tóm tắt/Định nghĩa: 1-2 câu ngắn gọn đi thẳng vào bản chất vấn đề.
 - ⚙️ Nguyên lý / Phân tích chuyên sâu: Cấu trúc hóa bằng gạch đầu dòng giải thích cách thức hoạt động hoặc các đặc điểm kỹ thuật cốt lõi.
 - ⚖️ So sánh / Ưu nhược điểm (Nếu câu hỏi mang tính chọn lựa): Đối chiếu các thông số kỹ thuật rõ ràng.
-- 💡 Góc nhìn chuyên gia (Thực tiễn): Lời khuyên ứng dụng trong môi trường xưởng in thực tế (VD: công nghệ này hợp với in bao bì số lượng lớn, hay in tem nhãn ngắn ngày?).
+- 💡 Góc nhìn chuyên môn (Thực tiễn): Lời khuyên ứng dụng trong môi trường xưởng in thực tế (VD: công nghệ này hợp với in bao bì số lượng lớn, hay in tem nhãn ngắn ngày?).
 
 ⚠️ QUY TẮC RÀNG BUỘC:
 - CHỈ sử dụng dữ liệu từ [CẨM NANG NGÀNH IN] để làm nền tảng.
@@ -568,18 +624,20 @@ def expand_book_queries(user_query: str, llm_main, max_queries: int = 3) -> List
 
 def expand_machine_queries(user_query: str, llm_main, max_queries: int = 3) -> List[str]:
     base_q = normalize_text(user_query)
-    # TỐI ƯU: Nếu câu hỏi đã dài (> 10 từ), không cần LLM viết lại
-    if len(base_q.split()) > 10:
+    if len(base_q.split()) > 15:
         return [base_q]
 
+    # PROMPT MỚI: ÉP LLM CẮT BỎ TỪ NHIỄU
     prompt = (
-        "Viết lại câu hỏi tìm máy thành các truy vấn ngắn để truy hồi chính xác hơn.\n"
+        "Bạn là chuyên gia tra cứu thiết bị ngành in.\n"
         f"Câu hỏi gốc: {base_q}\n"
+        "Nhiệm vụ: Lọc sạch các từ ngữ cảnh, CHỈ giữ lại TÊN MÁY hoặc CÔNG ĐOẠN cốt lõi để làm từ khóa tìm kiếm.\n"
+        "Ví dụ:\n"
+        "- Khách: 'Máy nào dùng để cán màng BOPP cho bao bì hộp giấy?' -> Kết quả: 'máy cán màng BOPP', 'máy cán màng'\n"
+        "- Khách: 'Tư vấn cho tôi máy bế hộp tốc độ cao' -> Kết quả: 'máy bế hộp', 'máy bế'\n"
         "Yêu cầu:\n"
-        "- Trả 2-3 biến thể ngắn, không thêm thông tin mới.\n"
-        "- Ưu tiên từ khóa công đoạn/chức năng/vật liệu (VD: ép nhũ, tráng phủ, bế, dán nếu là gia công sau in).\n"
-        "- Nếu câu hỏi về 'hộp', 'bao bì', 'mỹ phẩm', 'gia công sau in', hãy BẮT BUỘC mở rộng sang các từ khóa quy trình đầy đủ: ép nhũ (hot foil), dập nổi (embossing), tráng phủ (coating/laminating), bế (die-cutting), dán hộp (folder gluer).\n"
-        "- Mỗi dòng <= 12 từ."
+        "- TUYỆT ĐỐI bỏ các từ gây nhiễu: 'máy nào', 'dùng để', 'cho', 'tư vấn', 'tốc độ cao', 'bao bì', 'hộp giấy'.\n"
+        "- Trả về 2-3 cụm từ khóa cực kỳ ngắn gọn."
     )
     try:
         structured_llm = llm_main.with_structured_output(QueryRewriteResponse)
@@ -635,65 +693,58 @@ def extract_query_ngrams(user_query: str):
     trigrams = [f"{toks[i]} {toks[i+1]} {toks[i+2]}" for i in range(len(toks) - 2)]
     return unigrams, bigrams, trigrams
 
-def infer_query_operation_bucket(user_query: str) -> str:
-    q = normalize_for_match(user_query)
-    buckets = {
-        "lamination": ["can mang", "lamination", "bopp"],
-        "gluing": ["dan hop", "folder gluer", "gluer"],
-        "die_cut": ["be", "cat be", "die cut"],
-        "drilling": ["khoan", "drill"],
-        "ctp": ["ctp", "ghi ban", "ban kem"],
-        "printing": ["in", "offset", "flexo", "gravure", "digital"],
-    }
-    for b, terms in buckets.items():
-        if any(t in q for t in terms):
-            return b
+def get_operation_bucket(text: str) -> str:
+    q = normalize_for_match(text)
+    # Lamination
+    if re.search(r'\b(can mang|laminat|bopp|phu uv|trang phu)\b', q): return "lamination"
+    # Gluing (Dán)
+    if re.search(r'\b(dan hop|dan carton|dan cua so|thu hop|gluer|folder gluer)\b', q): return "gluing"
+    # Die cut (Bế/Ép kim)
+    if re.search(r'\b(be|cat be|die cut|ep kim|hot foil|dap noi|be phang|be cuon|thut nep)\b', q): return "die_cut"
+    # CTP (Chế bản)
+    if re.search(r'\b(ctp|ghi ban|ban kem|cron|ban in|phoi ban)\b', q): return "ctp"
+    # Printing (In)
+    if re.search(r'\b(in|offset|flexo|digital|printer|kts|ong dong|gravure)\b', q): return "printing"
+    # Cutting (Xén giấy)
+    if re.search(r'\b(xen|cat giay|guillotine)\b', q): return "cutting"
+    
     return "unknown"
 
+def infer_query_operation_bucket(user_query: str) -> str:
+    return get_operation_bucket(user_query)
+
 def doc_operation_bucket(doc: Document) -> str:
-    text = normalize_for_match(f"{doc.metadata.get('name', '')} {doc.page_content}")
-    bucket_terms = [
-        ("lamination", ["can mang", "lamination", "bopp"]),
-        ("gluing", ["dan hop", "folder gluer", "gluer"]),
-        ("die_cut", ["cat be", "die cut", "be"]),
-        ("drilling", ["khoan", "drill"]),
-        ("ctp", ["ctp", "ghi ban", "ban kem"]),
-        ("printing", ["may in", "offset", "flexo", "gravure", "digital"]),
-    ]
-    for b, terms in bucket_terms:
-        if any(t in text for t in terms):
-            return b
-    return "unknown"
+    # Quét Tên Máy trước, vì Tên Máy đại diện chính xác nhất cho công năng
+    name_bucket = get_operation_bucket(doc.metadata.get('name', ''))
+    if name_bucket != "unknown": 
+        return name_bucket
+    # Nếu Tên không rõ, mới quét vào Nội dung Mô tả
+    return get_operation_bucket(doc.page_content)
 
 def lexical_match_score(user_query: str, doc: Document) -> int:
     text = normalize_for_match(f"{doc.metadata.get('name', '')} {doc.page_content}")
     unigrams, bigrams, trigrams = extract_query_ngrams(user_query)
     score = 0
 
-    # NÂNG CẤP: Ưu tiên đặc biệt cho các máy làm hộp khi người dùng hỏi về "hộp"
-    q_norm = normalize_for_match(user_query)
-    is_box_query = any(t in q_norm for t in ["hop", "thung carton"])
-    doc_bucket = doc_operation_bucket(doc)
-    if is_box_query and doc_bucket in ["die_cut", "gluing"]:
-        score += 15 # Tăng điểm mạnh cho các máy bế và dán hộp
-
-    # Strongly prefer phrase-level matches over generic single words.
+    # 1. Điểm Ngram (Từ khóa liền kề)
     for t in trigrams:
-        if t in text:
-            score += 10
+        if t in text: score += 10
     for t in bigrams:
-        if t in text:
-            score += 5
+        if t in text: score += 5
     for t in unigrams:
-        if t in text:
-            score += 1
+        if t in text: score += 1
 
+    # 2. ÉP LUẬT DANH MỤC (HARD BUCKETING)
     q_bucket = infer_query_operation_bucket(user_query)
+    doc_bucket = doc_operation_bucket(doc)
+    
+    # Nếu hệ thống nhận diện được câu hỏi đang hỏi về công đoạn nào đó
     if q_bucket != "unknown":
         if doc_bucket == q_bucket:
-            score += 8
-        elif doc_bucket != "unknown":
-            score -= 8 # Phạt nặng hơn để tránh sai công đoạn
+            score += 100  # Thưởng điểm tuyệt đối cho máy ĐÚNG công đoạn
+        else:
+            score -= 500  # PHẠT CỰC NẶNG (-500) nếu máy bị lệch công đoạn hoặc unknown
+            
     return score
 
 def pre_rank_machine_candidates(user_query: str, docs, llm_main, top_n: int = 20):
@@ -742,48 +793,32 @@ def make_query_cache_key(query: str) -> str:
 
 def is_context_dependent_query(query: str) -> bool:
     q = normalize_for_match(query)
+    
+    # 1. Các cụm từ nối trực tiếp rõ ràng
     followup_markers = [
-        "y tren",
-        "cau tren",
-        "nhu tren",
-        "o tren",
-        "vua noi",
-        "giai thich them",
-        "noi ro hon",
-        "chi tiet hon",
-        "vi sao vay",
-        "tai sao vay",
-        "truong hop nay",
-        "van de nay",
-        "phan nay",
-        "phan do",
-        "cai nay",
-        "cai do",
-        "nhu vay",
-        "tiep theo",
-        "them nua",
+        "y tren", "cau tren", "nhu tren", "o tren", "vua noi",
+        "giai thich them", "noi ro hon", "chi tiet hon",
+        "vi sao vay", "tai sao vay", "truong hop nay",
+        "van de nay", "phan nay", "phan do", "cai nay", "cai do",
+        "nhu vay", "tiep theo", "them nua",
         "gia bao nhieu", "bao nhieu tien", "thong so the nao", "cau hinh ra sao"
     ]
     if any(m in q for m in followup_markers):
         return True
 
-    # Keep previous machine-consulting contextual cues.
-    machine_markers = [
-        "de chon may phu hop",
-        "can xac dinh",
-        "xac dinh dung luong",
-        "can thong tin gi",
-        "nhung yeu to nao",
-        "truoc khi chon may",
-        "nen xac dinh",
-        "don hang nay",
+    # 2. Bắt các câu yêu cầu lọc/tinh chỉnh (Refine markers)
+    refine_markers = [
+        "loai co", "loai dung", "loai chay", "loai lam", "loai khac", 
+        "dong may", "mau may", "mau khac",
+        "to hon", "nho hon", "nhanh hon", "re hon", "dat hon", "cao cap hon",
+        "tu dong", "thu cong", "co the", "vay thi", "neu the", "con loai"
     ]
-    if any(m in q for m in machine_markers):
+    if any(m in q for m in refine_markers):
         return True
 
     # Nếu câu hỏi chứa từ khóa tìm kiếm máy rõ ràng, coi như là context mới (Reset)
     new_search_signals = [
-        "tim may", "cho xem", "can mua", "bao gia may", "dong may", "loai may",
+        "tim may", "cho xem", "can mua", "bao gia may",
         "may in", "may be", "may dan", "may cat", "may ep", "may trang", "may gap", "may lam"
     ]
     if any(s in q for s in new_search_signals):
@@ -791,11 +826,13 @@ def is_context_dependent_query(query: str) -> bool:
         if not any(p in q for p in ["nay", "do", "vua roi", "tren", "cu", "vua xem"]):
             return False
 
+    # 3. Phân tích độ dài và đại từ (Tăng lên 12 từ để bắt được các câu dài hơn)
     tokens = [w for w in re.findall(r"[a-z0-9]+", q) if w.strip()]
-    if len(tokens) <= 7:
-        pronouns = {"nay", "do", "no", "vay", "them", "con", "roi"}
+    if len(tokens) <= 12:
+        pronouns = {"nay", "do", "no", "vay", "them", "con", "roi", "loai", "dong", "mau", "cai"}
         if any(t in pronouns for t in tokens):
             return True
+            
     return False
 
 def quick_intent_classify(user_query: str):
@@ -1123,37 +1160,82 @@ def send_sale_email(payload: dict):
         return False, "Missing SMTP config"
 
     msg = EmailMessage()
-    msg["Subject"] = "[VPRINT AI] Lead dat lich xem may / tu van truc tiep"
+    msg["Subject"] = f"[VPRINT AI] 🔥 Lead Mới: {payload.get('name', 'Khách')} - {payload.get('phone', '')}"
     msg["From"] = smtp_user
     msg["To"] = sale_notify
     machine_codes = payload.get("viewed_machine_codes", [])
     machine_codes_text = ", ".join(machine_codes) if machine_codes else "(chưa có dữ liệu)"
-    interest_summary = payload.get("interest_summary", "")
-
+    
+    # Xử lý format nội dung tóm tắt cho dễ đọc
+    raw_summary = payload.get("interest_summary", "")
+    # Chuyển đổi các dấu phân cách thành xuống dòng gạch đầu dòng
+    formatted_plain = raw_summary.replace(" ; ", "\n- ").replace(" | ", "\n  * ")
+    if formatted_plain: formatted_plain = "- " + formatted_plain
+    
     plain_body = (
-        "LEAD MOI TU CHATBOT VPRINT AI\n"
-        "=================================\n"
-        f"Ten: {payload.get('name', '')}\n"
-        f"So dien thoai: {payload.get('phone', '')}\n"
-        f"Email: {payload.get('email', '')}\n"
-        f"Linh vuc quan tam: {payload.get('interest_area', '')}\n"
-        f"Ma may khach da xem: {machine_codes_text}\n\n"
-        "Tom tat nhu cau khach:\n"
-        f"{interest_summary}\n"
+        "--------------------------------------------------\n"
+        "🚀 THÔNG BÁO LEAD MỚI TỪ CHATBOT VPRINT\n"
+        "--------------------------------------------------\n\n"
+        "1. THÔNG TIN LIÊN HỆ:\n"
+        f"- Họ tên: {payload.get('name', 'Unknown')}\n"
+        f"- SĐT:    {payload.get('phone', '')}\n"
+        f"- Email:  {payload.get('email', '')}\n\n"
+        "2. MỐI QUAN TÂM:\n"
+        f"- Lĩnh vực: {payload.get('interest_area', '')}\n"
+        f"- Máy đã xem: {machine_codes_text}\n\n"
+        "3. NGỮ CẢNH HỘI THOẠI:\n"
+        f"{formatted_plain}\n\n"
+        "--------------------------------------------------\n"
+        "Hệ thống VPRINT AI Sales Assistant"
     )
     msg.set_content(plain_body)
 
+    # HTML Body - Định dạng đẹp chuyên nghiệp
+    html_summary = escape(raw_summary).replace(" ; ", "<br>• ").replace(" | ", "<br>&nbsp;&nbsp;- ")
+    if html_summary: html_summary = "• " + html_summary
+
     html_body = f"""
     <html>
-      <body style="font-family: Arial, sans-serif; line-height:1.5;">
-        <h3>Lead mới từ chatbot VPRINT AI</h3>
-        <p><b>Tên:</b> {escape(payload.get('name', ''))}<br>
-           <b>SĐT:</b> {escape(payload.get('phone', ''))}<br>
-           <b>Email:</b> {escape(payload.get('email', ''))}<br>
-           <b>Lĩnh vực quan tâm:</b> {escape(payload.get('interest_area', ''))}<br>
-           <b>Mã máy khách đã xem:</b> {escape(machine_codes_text)}</p>
+      <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; background-color: #f4f4f4; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
+            <div style="background-color: #2563eb; padding: 20px; text-align: center;">
+                <h2 style="margin: 0; color: #ffffff; font-size: 20px;">🚀 LEAD KHÁCH HÀNG MỚI</h2>
+            </div>
+            <div style="padding: 25px;">
+                <h3 style="color: #1e40af; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px; margin-top: 0;">👤 Thông Tin Liên Hệ</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                    <tr>
+                        <td style="padding: 8px 0; width: 120px; color: #6b7280; font-weight: bold;">Họ tên:</td>
+                        <td style="padding: 8px 0; font-weight: bold; color: #111827;">{escape(payload.get('name', 'Unknown'))}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px 0; color: #6b7280; font-weight: bold;">Điện thoại:</td>
+                        <td style="padding: 8px 0; font-weight: bold; color: #dc2626; font-size: 16px;">{escape(payload.get('phone', ''))}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px 0; color: #6b7280; font-weight: bold;">Email:</td>
+                        <td style="padding: 8px 0; color: #2563eb;">
+                            <a href="mailto:{escape(payload.get('email', ''))}" style="text-decoration: none; color: #2563eb;">{escape(payload.get('email', ''))}</a>
+                        </td>
+                    </tr>
+                </table>
 
-        <p><b>Tóm tắt nhu cầu khách:</b><br>{escape(interest_summary)}</p>
+                <h3 style="color: #1e40af; border-bottom: 2px solid #e5e7eb; padding-bottom: 10px;">🎯 Nhu Cầu & Quan Tâm</h3>
+                <p style="margin: 10px 0;"><b>Lĩnh vực:</b> {escape(payload.get('interest_area', ''))}</p>
+                <p style="margin: 10px 0;"><b>Máy đã xem:</b> {escape(machine_codes_text)}</p>
+                
+                <div style="background-color: #f3f4f6; border-left: 4px solid #2563eb; padding: 15px; margin-top: 20px; border-radius: 4px;">
+                    <p style="margin-top: 0; font-weight: bold; color: #374151; margin-bottom: 10px;">📝 Tóm tắt ngữ cảnh hội thoại:</p>
+                    <div style="color: #4b5563; font-size: 14px; line-height: 1.5;">
+                        {html_summary}
+                    </div>
+                </div>
+            </div>
+            <div style="background-color: #f9fafb; padding: 15px; text-align: center; font-size: 12px; color: #9ca3af; border-top: 1px solid #e5e7eb;">
+                Email tự động từ VPRINT AI Sales Assistant<br>
+                {datetime.now().strftime("%d/%m/%Y %H:%M")}
+            </div>
+        </div>
       </body>
     </html>
     """
@@ -1279,19 +1361,16 @@ def load_system():
     docs = load_csv_docs(CSV_PATH)
     machine_store = Chroma.from_documents(documents=docs, embedding=machine_embedder, collection_name=COLLECTION_MACHINES)
     vector_retriever = machine_store.as_retriever(search_kwargs={"k": K_VECTOR})
-    bm25_retriever = BM25Retriever.from_documents(docs)
-    bm25_retriever.k = K_BM25
 
     book_embedder = OpenAIEmbeddings(model=EMBED_MODEL_BOOK, api_key=openai_api_key)
     book_store = Chroma(persist_directory=PERSIST_DIR, embedding_function=book_embedder, collection_name=COLLECTION_BOOK)
     book_retriever = book_store.as_retriever(search_kwargs={"k": 8})
 
-    return vector_retriever, bm25_retriever, book_retriever, machine_embedder
+    return vector_retriever, book_retriever, machine_embedder
 
-def hybrid_machine_search(
+def semantic_machine_search(
     user_query: str, 
     vector_retriever, 
-    bm25_retriever, 
     top_k: int, 
     llm_main=None, 
     target_format: str = "", 
@@ -1302,10 +1381,8 @@ def hybrid_machine_search(
         queries = expand_machine_queries(user_query, llm_main, max_queries=3)
 
     semantic_docs = []
-    bm25_docs = []
     for q in queries:
         semantic_docs.extend(vector_retriever.invoke(q))
-        bm25_docs.extend(bm25_retriever.invoke(q))
 
     rrf_k = 60.0
     scored = {}
@@ -1326,12 +1403,6 @@ def hybrid_machine_search(
 
     # 1. Chấm điểm RRF cơ bản cho Semantic Docs
     for rank, doc in enumerate(semantic_docs, start=1):
-        doc_id = str(doc.metadata.get("row_index")) if "row_index" in doc.metadata else doc.metadata.get("product_url", doc.page_content[:80])
-        entry = scored.setdefault(doc_id, {"doc": doc, "score": 0.0})
-        entry["score"] += 1.0 / (rrf_k + rank)
-
-    # 2. Chấm điểm RRF cơ bản cho BM25 Docs
-    for rank, doc in enumerate(bm25_docs, start=1):
         doc_id = str(doc.metadata.get("row_index")) if "row_index" in doc.metadata else doc.metadata.get("product_url", doc.page_content[:80])
         entry = scored.setdefault(doc_id, {"doc": doc, "score": 0.0})
         entry["score"] += 1.0 / (rrf_k + rank)
@@ -1448,7 +1519,7 @@ Chỉ trả về nhãn, không giải thích."""
         return "direct_chat"
 
 try:
-    machine_vector_retriever, machine_bm25_retriever, book_retriever, sys_embedder = load_system()
+    machine_vector_retriever, book_retriever, sys_embedder = load_system()
 except Exception as e:
     st.error(f"⚠️ Không thể khởi tạo hệ thống retrieval: {e}")
     st.stop()
@@ -1462,8 +1533,9 @@ with st.sidebar:
     
     # Đã thêm GPT-4o vào danh sách lựa chọn
     selected_model = st.selectbox("Chọn Model", [
-        "gpt-4o",
         "openai/gpt-oss-20b",
+        "gpt-4o",
+        
         "gpt-3.5-turbo",
         
         
@@ -1628,50 +1700,56 @@ if user_query:
                 book_docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=4)
                 book_context = format_book_context(book_docs)
                 
+                # --- BƯỚC 3: LUÔN LUÔN TÌM MÁY DÙ THÔNG TIN MỜ MỊT HAY RÕ RÀNG ---
                 machine_docs = []
                 machine_context = ""
                 
-                # --- BƯỚC 3: Rẽ nhánh Logic ---
+                # TÍNH TOÁN DYNAMIC TOP-K
+                # Nếu đã rõ ràng -> Chỉ chốt 1 máy tối ưu nhất cho mỗi công đoạn.
+                # Nếu còn mù mờ -> Đưa ra 2-3 máy để khách tham khảo các phân khúc.
+                dynamic_top_k = 1 if requirement.is_clear else 3
+                
+                for keyword in requirement.search_keywords:
+                    process_docs = semantic_machine_search(
+                        user_query=keyword,
+                        vector_retriever=machine_vector_retriever,
+                        top_k=6, # Vẫn lấy pool rộng để lọc
+                        llm_main=None,
+                        target_format=requirement.material_format,
+                        target_scale=requirement.production_scale
+                    )
+                    process_docs = deduplicate_docs(process_docs)
+                    
+                    # Truyền dynamic_top_k vào hàm Rerank
+                    top_process_docs = rerank_machine_candidates(keyword, process_docs, llm_main, top_k=dynamic_top_k)
+                    
+                    if top_process_docs:
+                        machine_docs.extend(top_process_docs)
+                        machine_context += f"\n--- MÁY TÌM ĐƯỢC CHO: {keyword.upper()} ---\n"
+                        machine_context += format_context(top_process_docs)
+
+                # --- BƯỚC 4: Rẽ nhánh Prompt dựa trên độ rõ ràng của yêu cầu ---
                 if not requirement.is_clear:
-                    # TÌNH HUỐNG A: Yêu cầu mù mờ -> Ngừng tìm máy, chỉ hỏi lại
-                    machine_context = "Chưa tìm kiếm máy vì yêu cầu chưa đủ thông tin đầu vào."
+                    # TÌNH HUỐNG A: Yêu cầu mù mờ -> Hỏi lại, nhưng có thể dùng máy đã tìm được làm VÍ DỤ
                     sys_prompt = f"""Bạn là chuyên gia tư vấn giải pháp của VPRINT.
                     Khách hàng đang nhờ tư vấn, nhưng thông tin quá chung chung.
                     Phân tích hệ thống cho thấy ta đang thiếu: {', '.join(requirement.missing_info)}
                     
                     Nhiệm vụ:
                     1. Tuyệt đối KHÔNG đề xuất bừa một model máy cụ thể nào ở bước này.
-                    2. Dựa vào [CẨM NANG], giải thích nhẹ nhàng cho khách hiểu tại sao việc xác định các yếu tố trên (như vật liệu, sản lượng) lại quan trọng để chọn đúng máy.
+                    2. Dựa vào [CẨM NANG] và [VÍ DỤ MÁY], giải thích nhẹ nhàng cho khách hiểu tại sao việc xác định các yếu tố trên (như vật liệu, sản lượng) lại quan trọng để chọn đúng máy.
                     3. Đặt 2-3 câu hỏi ngắn gọn, lịch sự để khách hàng cung cấp thêm thông tin.
                     
+                    [VÍ DỤ MÁY]:
+                    {machine_context if machine_context else "Chưa tìm thấy máy ví dụ phù hợp."}
+
                     [CẨM NANG NGÀNH IN]:
                     {book_context}
                     """
                     messages = [("system", sys_prompt)] + get_optimized_history(turn_history, history_limit) + [("user", user_query)]
                 
                 else:
-                    # TÌNH HUỐNG B: Yêu cầu đã rõ -> Truy hồi nhắm mục tiêu cho TỪNG công đoạn
-                    for keyword in requirement.search_keywords:
-                        # Tìm kiếm máy chỉ tập trung vào 1 công đoạn cụ thể (VD: "máy cán màng")
-                        process_docs = hybrid_machine_search(
-                            user_query=keyword,
-                            vector_retriever=machine_vector_retriever,
-                            bm25_retriever=machine_bm25_retriever,
-                            top_k=6, 
-                            llm_main=None, # Không gọi LLM expand thêm để tiết kiệm thời gian, keyword đã chuẩn rồi
-                            target_format=requirement.material_format, # Truyền định dạng từ Pydantic
-                            target_scale=requirement.production_scale  # Truyền quy mô từ Pydantic
-                        )
-                        process_docs = deduplicate_docs(process_docs)
-                        
-                        # Rerank lại để lấy đúng 2 máy tốt nhất cho công đoạn này
-                        top_process_docs = rerank_machine_candidates(keyword, process_docs, llm_main, top_k=2)
-                        
-                        if top_process_docs:
-                            machine_docs.extend(top_process_docs)
-                            machine_context += f"\n--- TÌM KIẾM MÁY CHO: {keyword.upper()} ---\n"
-                            machine_context += format_context(top_process_docs)
-                    
+                    # TÌNH HUỐNG B: Yêu cầu đã rõ -> Trình bày giải pháp
                     # Lọc trùng lặp nếu có máy đa năng (VD: vừa in vừa bế)
                     machine_docs = deduplicate_docs(machine_docs)
                     
@@ -1709,24 +1787,37 @@ if user_query:
                 search_query = user_query
                 if has_context_dependency and st.session_state.last_docs:
                     last_machine_name = st.session_state.last_docs[0].metadata.get("name", "")
-                    if last_machine_name:
-                        # Chỉ bổ sung ngữ cảnh cho Search, không đổi user_query hiển thị
+                    q_norm = normalize_for_match(user_query)
+                    
+                    # Chỉ nối tên máy cũ vào nếu câu hỏi HIỆN TẠI KHÔNG có từ khóa tìm loại máy MỚI
+                    new_machine_keywords = ["may in", "may be", "may dan", "may can", "may ep", "may ghi"]
+                    is_asking_new_machine = any(k in q_norm for k in new_machine_keywords)
+                    
+                    if last_machine_name and not is_asking_new_machine:
                         search_query = f"{user_query} ({last_machine_name})"
 
-                filtered_docs = hybrid_machine_search(
+                filtered_docs = semantic_machine_search(
                     search_query,
                     machine_vector_retriever,
-                    machine_bm25_retriever,
                     SEARCH_POOL_K,
                     llm_main,
                 )
                 filtered_docs = deduplicate_docs(filtered_docs)[:SEARCH_POOL_K]
 
+            # TÍNH TOÁN DYNAMIC TOP-K CHO TÌM KIẾM TRỰC TIẾP
+            q_norm = normalize_for_match(user_query)
+            # Kiểm tra xem có số (thể hiện model/thông số) hoặc câu hỏi mô tả dài không
+            has_specs = bool(re.search(r'\d+', q_norm)) 
+            is_detailed = len(user_query.split()) > 7
+            
+            dynamic_top_k = 1 if (has_specs or is_detailed) else 3
+
+            # Gọi Rerank với Top-K động
             suggested_docs = rerank_machine_candidates(
                 user_query=user_query,
                 candidate_docs=filtered_docs,
                 llm_main=llm_main,
-                top_k=3,
+                top_k=dynamic_top_k, 
             )
 
             if not suggested_docs:
@@ -1735,8 +1826,13 @@ if user_query:
                     st.markdown(raw_answer, unsafe_allow_html=True)
             else:
                 track_viewed_machines(suggested_docs)
-                raw_answer = "👋 Dựa trên yêu cầu, đây là các dòng máy phù hợp nhất:\n\n"
-
+                
+                # Sửa câu chào dựa trên số lượng máy
+                if len(suggested_docs) == 1:
+                    raw_answer = "👋 Dựa trên thông số chi tiết bạn cung cấp, đây là cấu hình máy tối ưu nhất:\n\n"
+                else:
+                    raw_answer = "👋 Để bạn dễ hình dung, VPRINT xin gợi ý một vài dòng máy phù hợp với các phân khúc khác nhau:\n\n"
+                
                 is_spec_request = any(k in normalize_for_match(user_query) for k in ["thong so", "cau hinh", "spec", "ky thuat", "chi tiet"])
 
                 with thinking_indicator():
@@ -1748,7 +1844,10 @@ if user_query:
                         name = doc.metadata.get("name", f"Sản phẩm {i+1}")
                         url = doc.metadata.get("product_url", "")
                         imgs = parse_images(doc.metadata.get("images", ""))
-                        raw_answer += f"### 🏆 Top {i+1}: **[{name}]({url})**\n"
+                        if len(suggested_docs) > 1:
+                            raw_answer += f"### 🏆 Top {i+1}: **[{name}]({url})**\n"
+                        else:
+                            raw_answer += f"### 🏆 **[{name}]({url})**\n"
                         if imgs:
                             img_html = "".join(
                                 [f'<img src="{img}" style="height:140px;margin-right:8px;border-radius:8px;border:1px solid #ddd;object-fit:contain;">' for img in imgs[:3]]
@@ -1757,19 +1856,19 @@ if user_query:
 
                         if i < len(machine_summaries):
                             s = machine_summaries[i]
+                            
+                            # Trích xuất chuỗi JSON gốc từ page_content thay vì dùng s.performance đã bị cắt cụt
+                            specs_json_str = extract_labeled_value(doc.page_content, "Specifications")
+                            
+                            # Render thành bảng Markdown
+                            formatted_performance = format_specs_to_json_table(specs_json_str)
+
                             raw_answer += (
                                 f"- **Mô tả:** {s.description}\n"
-                                f"- **Tốc độ/Hiệu suất:** {s.performance}\n"
+                                f"**📊 Tốc độ / Hiệu suất:**\n\n{formatted_performance}\n\n"
                                 f"- **Công nghệ:** {s.technology}\n"
                                 f"- **Điểm ưu việt:** {s.advantage}\n\n"
                             )
-
-                        if is_spec_request:
-                            specs_txt = extract_labeled_value(doc.page_content, "Specifications")
-                            if specs_txt:
-                                table = format_specs_to_table(specs_txt)
-                                if table:
-                                    raw_answer += f"\n**📋 Thông số kỹ thuật:**\n\n{table}\n\n"
 
                         raw_answer += "---\n\n"
                         # Cập nhật UI ngay lập tức sau mỗi máy để người dùng không phải chờ
