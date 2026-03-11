@@ -17,8 +17,11 @@ langchain-openai
 langchain-chroma
 langchain-community
 chromadb
-rank_bm25
 
 # Core LangChain components
 langchain-core
 tiktoken
+langchain-huggingface
+langchain-classic
+langgraph
+rank_bm25

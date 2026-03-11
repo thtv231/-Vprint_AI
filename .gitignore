@@ -1,12 +1,18 @@
 ﻿# Bỏ qua các file bảo mật
+# Environment variables (Chứa API Key - KHÔNG UP LÊN GIT)
 .env
 .streamlit/secrets.toml
 vprint-chat-log-*.json
 
 # Bỏ qua môi trường ảo và thư mục rác của Python
 .venv/
+# Python compilation
 __pycache__/
 *.pyc
 
 # Bỏ qua database vector nếu nó quá nặng (Tùy chọn)
-# vprint_agentic_db_local/git add .
+# Vector Database (Nên build lại từ data gốc thay vì up lên)
+vprint_agentic_db_local/
+
+# System
+.DS_Store

@@ -3,6 +3,7 @@ import time
 import re
 import json
 import os
+import torch
 import threading
 import smtplib
 import unicodedata
@@ -24,6 +25,10 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:
+    from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # --- Import từ file logic chung ---
 from chatbot_vprint_hybrid_local import (
@@ -154,10 +159,12 @@ PERSIST_DIR = "vprint_agentic_db_local"
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1GvR6uMGIT0J1MHJplPsepbWDALntCgLAT9ENrhqidEc/edit"
 
 COLLECTION_MACHINES = "vprint_products_local"
-EMBED_MODEL_MACHINES = "text-embedding-3-small"
+#EMBED_MODEL_MACHINES = "intfloat/multilingual-e5-small"
+EMBED_MODEL_MACHINES = "intfloat/multilingual-e5-base"
 
 COLLECTION_BOOK = "vprint_knowledge_base"
-EMBED_MODEL_BOOK = "text-embedding-3-small"
+#EMBED_MODEL_BOOK = "intfloat/multilingual-e5-small"
+EMBED_MODEL_BOOK = "intfloat/multilingual-e5-base"
 
 K_VECTOR, K_BM25, K_FINAL, MAX_HISTORY = 20, 20, 5, 5
 SEARCH_POOL_K = 24
@@ -273,6 +280,22 @@ def parse_consulting_request(user_query: str, turn_history: list, llm_main) -> C
         # Fallback an toàn nếu LLM parse lỗi
         return ConsultingRequirement(is_clear=True, missing_info=[], product_type="Chưa rõ", material_format="Chưa rõ", production_scale="Chưa rõ", suggested_processes=["Sản xuất in ấn"], search_keywords=[user_query])
 
+def smart_truncate(text: str, max_len: int = 260) -> str:
+    """Hàm cắt chuỗi thông minh, không cắt ngang từ và thêm dấu ..."""
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    
+    # Cắt nháp trước
+    truncated = text[:max_len]
+    # Tìm khoảng trắng cuối cùng để không làm đứt từ
+    last_space = truncated.rfind(' ')
+    
+    if last_space > 0:
+        return truncated[:last_space] + "..."
+    return truncated + "..."
+
 def build_fallback_machine_summary(doc: Document) -> MachineSummary:
     raw = str(doc.page_content or "")
     name = str(doc.metadata.get("name", "")).strip() 
@@ -280,12 +303,12 @@ def build_fallback_machine_summary(doc: Document) -> MachineSummary:
     desc = extract_labeled_value(raw, "Description")
     features = extract_labeled_value(raw, "Features")
     specs = extract_labeled_value(raw, "Specifications")
-    specs_short = specs[:220] + "..." if len(specs) > 220 else specs
+    
     return MachineSummary(
-        description=(summary or desc or f"Thiết bị {name}.")[:260],
-        performance=(specs_short or "Vui lòng liên hệ VPRINT để nhận thông số hiệu suất chi tiết.")[:260],
-        technology=(features or desc or "Cấu hình công nghiệp, vận hành ổn định.")[:260],
-        advantage=(summary or features or "Phù hợp cho nhu cầu sản xuất bao bì.")[:260],
+        description=smart_truncate(summary or desc or f"Thiết bị {name}.", 260),
+        performance=smart_truncate(specs or "Vui lòng liên hệ VPRINT để nhận thông số hiệu suất chi tiết.", 260),
+        technology=smart_truncate(features or desc or "Cấu hình công nghiệp, vận hành ổn định.", 260),
+        advantage=smart_truncate(summary or features or "Phù hợp cho nhu cầu sản xuất bao bì.", 260),
     )
 
 def apply_router_guards(user_query: str, decision: RouterDecision) -> RouterDecision:
@@ -1353,16 +1376,22 @@ def is_garbage_response(text: str) -> bool:
 # ==========================================
 @st.cache_resource
 def load_system():
-    openai_api_key = get_safe_api_key("OPENAI_API_KEY")
-    if not openai_api_key:
-        raise ValueError("Không tìm thấy OPENAI_API_KEY để khởi tạo OpenAI Embeddings.")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    machine_embedder = OpenAIEmbeddings(model=EMBED_MODEL_MACHINES, api_key=openai_api_key)
+    machine_embedder = HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL_MACHINES,
+        model_kwargs={"device": device},
+        encode_kwargs={"normalize_embeddings": True}
+    )
     docs = load_csv_docs(CSV_PATH)
     machine_store = Chroma.from_documents(documents=docs, embedding=machine_embedder, collection_name=COLLECTION_MACHINES)
     vector_retriever = machine_store.as_retriever(search_kwargs={"k": K_VECTOR})
 
-    book_embedder = OpenAIEmbeddings(model=EMBED_MODEL_BOOK, api_key=openai_api_key)
+    book_embedder = HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL_BOOK,
+        model_kwargs={"device": device},
+        encode_kwargs={"normalize_embeddings": True}
+    )
     book_store = Chroma(persist_directory=PERSIST_DIR, embedding_function=book_embedder, collection_name=COLLECTION_BOOK)
     book_retriever = book_store.as_retriever(search_kwargs={"k": 8})
 
@@ -1534,15 +1563,13 @@ with st.sidebar:
     # Đã thêm GPT-4o vào danh sách lựa chọn
     selected_model = st.selectbox("Chọn Model", [
         "openai/gpt-oss-20b",
+        "llama-3.3-70b-versatile",
+        
         "gpt-4o",
-        
         "gpt-3.5-turbo",
-        
-        
-        
-         
         "qwen/qwen3-32b", 
-        "llama-3.1-8b-instant"
+        "llama-3.1-8b-instant",
+        
     ])
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2)
     
@@ -1644,6 +1671,7 @@ if user_query:
             temperature=temperature,
             openai_api_key=openai_api_key,
             stream_usage=True,
+            max_tokens=3000,
         )
     else:
         if not groq_api_key:
@@ -1653,6 +1681,7 @@ if user_query:
             model_name=selected_model,
             temperature=temperature,
             groq_api_key=groq_api_key,
+            max_tokens=3000,
         )
     
     start = time.perf_counter()
