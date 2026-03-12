@@ -1,8 +1,10 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import time
 import re
 import json
 import os
+import base64
 import torch
 import threading
 import smtplib
@@ -24,7 +26,6 @@ import pytz
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
 except ImportError:
@@ -190,6 +191,12 @@ WELCOME = """
 </div>
 """
 
+logo_watermark_b64 = ""
+logo_watermark_path = Path("img/logo_2.jpg")
+if logo_watermark_path.exists():
+    logo_watermark_b64 = base64.b64encode(logo_watermark_path.read_bytes()).decode("ascii")
+logo_watermark_css = f'url("data:image/jpeg;base64,{logo_watermark_b64}")' if logo_watermark_b64 else "none"
+
 # ==========================================
 # 2.1 TEXT NORMALIZATION + RAG HELPERS
 # ==========================================
@@ -212,6 +219,30 @@ def normalize_for_match(text: str) -> str:
     s = unicodedata.normalize("NFD", text.lower())
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return re.sub(r"\s+", " ", s).strip()
+
+def get_response_language_instruction(user_query: str) -> str:
+    q = str(user_query or "").strip()
+    if not q:
+        return "Trả lời bằng đúng ngôn ngữ người dùng sử dụng."
+
+    ascii_q = q.encode("ascii", errors="ignore").decode("ascii")
+    lowered = ascii_q.lower()
+    english_markers = [
+        "what", "how", "why", "which", "can you", "could you", "please",
+        "machine", "printing", "paper cup", "price", "specification",
+        "i need", "i want", "tell me", "help me", "for my factory",
+    ]
+    vietnamese_markers = [
+        "máy", "giá", "thông số", "tư vấn", "giúp", "cần", "muốn", "bao nhiêu",
+        "như thế nào", "ly giấy", "in ấn", "xưởng", "bạn",
+    ]
+
+    english_hits = sum(1 for marker in english_markers if marker in lowered)
+    vietnamese_hits = sum(1 for marker in vietnamese_markers if marker in q.lower())
+
+    if english_hits > vietnamese_hits:
+        return "Answer in English. Keep the full response in English unless the user asks to switch language."
+    return "Trả lời bằng tiếng Việt. Nếu người dùng chuyển sang tiếng Anh thì trả lời bằng tiếng Anh."
 
 def is_book_knowledge_intent(query: str) -> bool:
     q = normalize_for_match(query)
@@ -502,10 +533,12 @@ def get_optimized_history(history, max_history=5, max_bot_chars=200):
     return optimized_msgs
 
 def build_rag_messages(user_query, context, history, max_history=5):
+    language_instruction = get_response_language_instruction(user_query)
     sys_prompt = f"""Bạn là Chuyên gia AI của VPRINT.
     Sử dụng thông tin trong [KHO DỮ LIỆU] dưới đây để trả lời khách hàng.
     Nếu không có thông tin, hãy nói không biết, TUYỆT ĐỐI KHÔNG BỊA ĐẶT.
     Không lặp lại câu hỏi của người dùng.
+    {language_instruction}
 
     [KHO DỮ LIỆU]:
     {context}
@@ -513,9 +546,11 @@ def build_rag_messages(user_query, context, history, max_history=5):
     return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
 
 def build_book_rag_messages(user_query, context, history, max_history=5):
+    language_instruction = get_response_language_instruction(user_query)
     sys_prompt = f"""Bạn là Chuyên gia Cấp cao về Công nghệ In ấn & Bao bì của VPRINT, với hơn 20 năm kinh nghiệm nghiên cứu, vận hành máy và giảng dạy ngành in.
     
 Nhiệm vụ của bạn là giải đáp các câu hỏi kỹ thuật ngành in dựa trên [CẨM NANG NGÀNH IN].
+{language_instruction}
 
 ✨ TIÊU CHUẨN CỦA MỘT CHUYÊN GIA:
 1. Sâu sắc & Chính xác: Không chỉ trả lời "Cái gì" (What) mà phải giải thích "Tại sao" (Why) và "Như thế nào" (How).
@@ -731,6 +766,9 @@ def get_operation_bucket(text: str) -> str:
     # Cutting (Xén giấy)
     if re.search(r'\b(xen|cat giay|guillotine)\b', q): return "cutting"
     
+    # Cup making (Ly giấy)
+    if re.search(r'\b(ly giay|coc giay|lam ly|lam coc|paper cup)\b', q): return "cup_making"
+    
     return "unknown"
 
 def infer_query_operation_bucket(user_query: str) -> str:
@@ -885,15 +923,18 @@ def quick_intent_classify(user_query: str):
     return None # Nếu không chắc chắn, để LLM quyết định
 
 def build_direct_messages(user_query, history, max_history=5):
-    sys_prompt = """Bạn là trợ lý AI của VPRINT.
+    language_instruction = get_response_language_instruction(user_query)
+    sys_prompt = f"""Bạn là trợ lý AI của VPRINT.
     Đây là cuộc trò chuyện thông thường, chào hỏi hoặc câu hỏi không cần truy hồi dữ liệu.
     Hãy trả lời tự nhiên, lịch sự, ngắn gọn.
     Nếu phù hợp, có thể gợi ý khách hỏi thêm về máy móc hoặc công nghệ ngành in.
+    {language_instruction}
     """
     return [("system", sys_prompt)] + get_optimized_history(history, max_history, max_bot_chars=100) + [("user", user_query)]
 
 def build_general_knowledge_fallback_messages(user_query, history, max_history=5):
-    sys_prompt = """Bạn là Kỹ sư Trưởng chuyên xử lý sự cố và vận hành xưởng in của VPRINT.
+    language_instruction = get_response_language_instruction(user_query)
+    sys_prompt = f"""Bạn là Kỹ sư Trưởng chuyên xử lý sự cố và vận hành xưởng in của VPRINT.
 Hiện tại, hệ thống Cẩm nang nội bộ không chứa tài liệu trực tiếp về câu hỏi này. Tuy nhiên, với kinh nghiệm uyên thâm của mình, bạn hãy tư vấn cho khách hàng dựa trên tiêu chuẩn chung của ngành công nghiệp in (ISO 12647, FOGRA, G7...).
 
 📝 Hướng dẫn trả lời:
@@ -902,6 +943,7 @@ Hiện tại, hệ thống Cẩm nang nội bộ không chứa tài liệu trự
 3. Đề xuất hướng kiểm tra hoặc khắc phục từng bước (Troubleshooting steps).
 4. Giữ phong thái chuyên nghiệp, dùng từ vựng kỹ thuật chuẩn xác (VD: overprinting, trapping, tack mực, pH nước máng...).
 5. Khéo léo gợi ý khách hàng có thể liên hệ kỹ thuật viên VPRINT để được hỗ trợ chuyên sâu hơn.
+{language_instruction}
 """
     return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
 
@@ -918,10 +960,12 @@ def thinking_indicator():
         placeholder.empty()
 
 def build_solution_consulting_messages(user_query, machine_context, book_context, history, max_history=5):
+    language_instruction = get_response_language_instruction(user_query)
     sys_prompt = f"""Bạn là kỹ sư tư vấn giải pháp của VPRINT.
 Hãy phân tích yêu cầu sản xuất và tư vấn giải pháp chặt chẽ dựa trên 2 nguồn:
 1. [KHO MÁY VPRINT]
 2. [CẨM NANG NGÀNH IN]
+{language_instruction}
 
 Quy tắc:
 - **QUAN TRỌNG**: Nếu yêu cầu của khách hàng rất chung chung, không rõ ràng (VD: 'tìm máy in', 'tư vấn máy bế'), hãy **BẮT ĐẦU** bằng việc hỏi các câu hỏi để làm rõ nhu cầu (sản phẩm là gì, sản lượng, vật liệu, khổ in...) trước khi đề xuất bất kỳ máy nào. Đừng cố gắng đoán ý và gợi ý máy ngay.
@@ -1361,7 +1405,8 @@ def rerank_machine_candidates(user_query: str, candidate_docs, llm_main, top_k: 
     
     # Sắp xếp giảm dần theo điểm
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [d for _, d in scored[:top_k]]
+    valid_candidates = [d for score, d in scored if score >= 0]
+    return valid_candidates[:top_k]
 
 def is_garbage_response(text: str) -> bool:
     t = text.lower()
@@ -1378,24 +1423,44 @@ def is_garbage_response(text: str) -> bool:
 def load_system():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    machine_embedder = HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL_MACHINES,
+    # 1. Chỉ khởi tạo 1 Embedder duy nhất (Tiết kiệm một nửa thời gian load và RAM)
+    embedder = HuggingFaceEmbeddings(
+        model_name=EMBED_MODEL_MACHINES, 
         model_kwargs={"device": device},
         encode_kwargs={"normalize_embeddings": True}
     )
-    docs = load_csv_docs(CSV_PATH)
-    machine_store = Chroma.from_documents(documents=docs, embedding=machine_embedder, collection_name=COLLECTION_MACHINES)
+
+    # 2. Xử lý Machine Store: Lưu xuống ổ cứng để không phải embed lại từ file CSV
+    MACHINE_PERSIST_DIR = "vprint_machines_db_local" # Thư mục lưu DB máy móc
+    
+    if os.path.exists(MACHINE_PERSIST_DIR) and os.listdir(MACHINE_PERSIST_DIR):
+        # Nếu đã tạo DB trước đó, chỉ cần load lên (Tốc độ tính bằng mili-giây)
+        machine_store = Chroma(
+            persist_directory=MACHINE_PERSIST_DIR, 
+            embedding_function=embedder, 
+            collection_name=COLLECTION_MACHINES
+        )
+    else:
+        # Nếu chưa có, mới đọc CSV và nhúng vector (Chỉ chậm ở LẦN CHẠY ĐẦU TIÊN)
+        docs = load_csv_docs(CSV_PATH)
+        machine_store = Chroma.from_documents(
+            documents=docs, 
+            embedding=embedder, 
+            collection_name=COLLECTION_MACHINES,
+            persist_directory=MACHINE_PERSIST_DIR # Ghi xuống ổ cứng
+        )
+        
     vector_retriever = machine_store.as_retriever(search_kwargs={"k": K_VECTOR})
 
-    book_embedder = HuggingFaceEmbeddings(
-        model_name=EMBED_MODEL_BOOK,
-        model_kwargs={"device": device},
-        encode_kwargs={"normalize_embeddings": True}
+    # 3. Xử lý Book Store (Dùng chung embedder)
+    book_store = Chroma(
+        persist_directory=PERSIST_DIR, 
+        embedding_function=embedder, 
+        collection_name=COLLECTION_BOOK
     )
-    book_store = Chroma(persist_directory=PERSIST_DIR, embedding_function=book_embedder, collection_name=COLLECTION_BOOK)
     book_retriever = book_store.as_retriever(search_kwargs={"k": 8})
 
-    return vector_retriever, book_retriever, machine_embedder
+    return vector_retriever, book_retriever, embedder
 
 def semantic_machine_search(
     user_query: str, 
@@ -1467,20 +1532,8 @@ def semantic_machine_search(
     merged = sorted(scored.values(), key=lambda x: x["score"], reverse=True)
     return [item["doc"] for item in merged[:top_k]]
 
-def build_decision_llm(groq_api_key, openai_api_key, fallback_llm=None):
-    # Ưu tiên 1: Dùng GPT-3.5-Turbo vì nó rẻ, nhanh và có structured output tốt
-    try:
-        if openai_api_key:
-            return ChatOpenAI(
-                model_name="gpt-3.5-turbo",
-                temperature=0.0,
-                openai_api_key=openai_api_key,
-                max_tokens=50, # Chỉ cần lấy nhãn intent
-            )
-    except Exception:
-        pass
-    
-    # Ưu tiên 2: Dùng Groq Llama 8B nếu có
+def build_decision_llm(groq_api_key, fallback_llm=None):
+    # Ưu tiên 2: Dùng Groq z 8B nếu có
     try:
         if groq_api_key:
             return ChatGroq(
@@ -1560,16 +1613,13 @@ with st.sidebar:
     st.image("img/logo_2.jpg", width=200)
     st.header("⚙️ Model Settings")
     
-    # Đã thêm GPT-4o vào danh sách lựa chọn
     selected_model = st.selectbox("Chọn Model", [
         "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
         "llama-3.3-70b-versatile",
-        
-        "gpt-4o",
-        "gpt-3.5-turbo",
-        "qwen/qwen3-32b", 
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it",
         "llama-3.1-8b-instant",
-        
     ])
     temperature = st.slider("Temperature", 0.0, 1.0, 0.2)
     
@@ -1596,84 +1646,354 @@ with st.sidebar:
 
 st.title("🤖 VPRINT Sales AI")
 
-for role, msg in st.session_state.history:
-    avatar = "👤" if role == "user" else "img/logo_2.jpg" 
-    with st.chat_message(role, avatar=avatar): st.markdown(msg, unsafe_allow_html=True)
-
-if len(st.session_state.history) == 0: 
-    st.markdown(WELCOME, unsafe_allow_html=True)
-
 # ==========================================
 # 7. LOGIC XỬ LÝ CHÍNH
 # ==========================================
-user_query = st.chat_input("Nhập câu hỏi...")
+# 1. TẠO CONTAINER HỨNG CHAT (Luôn nằm trên thanh chat)
+# 1. TẠO CONTAINER HỨNG CHAT (Luôn nằm trên thanh chat)
+chat_container = st.container()
 
+with chat_container:
+    # Hiển thị lịch sử chat vào trong container này
+    for role, msg in st.session_state.history:
+        avatar = "👤" if role == "user" else "img/logo_2.jpg" 
+        with st.chat_message(role, avatar=avatar): 
+            st.markdown(msg, unsafe_allow_html=True)
+            
+    if len(st.session_state.history) == 0: 
+        st.markdown(WELCOME, unsafe_allow_html=True)
+
+# ==========================================
+# 2. INPUT NGƯỜI DÙNG (CUSTOM GEMINI UI - WHITE & VOICE)
+# ==========================================
+
+groq_api_key = get_safe_api_key("GROQ_API_KEY")
+
+st.markdown(
+    f"""
+<style>
+    :root {{
+        --chat-font: "Source Sans Pro", sans-serif;
+    }}
+    .stApp {{
+        background: #fcfcfc;
+        font-family: var(--chat-font) !important;
+    }}
+    .main .block-container {{
+        background: #fcfcfc;
+        padding-bottom: 140px;
+        position: relative;
+        z-index: 0;
+        font-family: var(--chat-font) !important;
+    }}
+    .main .block-container > * {{
+        position: relative;
+        z-index: 1;
+    }}
+    section[data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, #d7dee8 0%, #c6d0dc 100%) !important;
+        border-right: 1px solid #b9c5d3;
+    }}
+    section[data-testid="stSidebar"] > div {{
+        background: transparent !important;
+    }}
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main {{
+        background: #fcfcfc !important;
+        font-family: var(--chat-font) !important;
+    }}
+    .stChatMessage,
+    .stChatMessage *,
+    .stMarkdown,
+    .stMarkdown *,
+    div[data-testid="stChatMessageContent"],
+    div[data-testid="stChatMessageContent"] *,
+    div[data-testid="stCaptionContainer"],
+    div[data-testid="stCaptionContainer"] *,
+    label,
+    input,
+    textarea,
+    button {{
+        font-family: var(--chat-font) !important;
+    }}
+    div[data-testid="stChatInput"] {{
+        display: none !important;
+    }}
+    .main .block-container::before {{
+        content: "";
+        position: fixed;
+        left: 19rem;
+        top: 10rem;
+        width: 70vw;
+        height: 70vh;
+        background-image: {logo_watermark_css};
+        background-repeat: no-repeat;
+        background-position: left center;
+        background-size: contain;
+        opacity: 0.055;
+        pointer-events: none;
+        z-index: 0;
+        filter: grayscale(1);
+    }}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+text_query = st.chat_input("Hỏi bất kỳ điều gì")
+
+custom_chat_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        html, body {{
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            font-family: "Source Sans Pro", sans-serif;
+        }}
+        .chat-container {{
+            background-color: #ffffff;
+            border-radius: 36px;
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            box-sizing: border-box;
+            width: 100%;
+            height: 72px;
+            border: 1px solid #dfdfdf;
+        }}
+        .chat-input {{
+            background: transparent;
+            border: none;
+            color: #111827;
+            font-size: 17px;
+            outline: none;
+            flex-grow: 1;
+            width: 100%;
+        }}
+        .chat-input::placeholder {{ color: #9ca3af; }}
+        .right-section {{ display: flex; align-items: center; gap: 12px; }}
+        .icon-btn {{ cursor: pointer; display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; border-radius: 50%; transition: all 0.2s; }}
+        .icon-btn svg {{ fill: #6b7280; width: 28px; height: 28px; transition: fill 0.2s; }}
+        #mic-icon {{ width: 40px; height: 40px; }}
+        #mic-icon svg {{ width: 30px; height: 30px; }}
+        .icon-btn:hover {{ background-color: #f3f4f6; }}
+        .icon-btn:hover svg {{ fill: #111827; }}
+        .recording svg {{ fill: #ef4444 !important; animation: pulse 1.5s infinite; }}
+        @keyframes pulse {{
+            0% {{ transform: scale(1); }}
+            50% {{ transform: scale(1.15); }}
+            100% {{ transform: scale(1); }}
+        }}
+        #send-icon {{ display: none; }}
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <input type="text" id="gemini-input" class="chat-input" placeholder="Hỏi bất cứ điều gì" autocomplete="off">
+        <div class="right-section">
+            <div id="mic-icon" class="icon-btn" title="Nhấn để nói">
+                <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5zm6 6c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+            </div>
+
+            <div id="send-icon" class="icon-btn">
+                <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const GROQ_API_KEY = "{groq_api_key}";
+
+        const frame = window.frameElement;
+        function layoutChatFrame() {{
+            if (!frame) return;
+            const sidebar = window.parent.document.querySelector('section[data-testid="stSidebar"]');
+            const sidebarWidth = sidebar ? sidebar.getBoundingClientRect().width : 0;
+            const viewportWidth = window.parent.innerWidth || window.innerWidth;
+            const horizontalPadding = 32;
+            const availableWidth = Math.max(640, Math.min(1040, viewportWidth - sidebarWidth - horizontalPadding * 2));
+            const centerOffset = sidebarWidth / 2;
+
+            frame.style.position = 'fixed';
+            frame.style.bottom = '25px';
+            frame.style.left = `calc(50% + ${{centerOffset}}px)`;
+            frame.style.transform = 'translateX(-50%)';
+            frame.style.width = `${{availableWidth}}px`;
+            frame.style.maxWidth = '1040px';
+            frame.style.minWidth = '640px';
+            frame.style.zIndex = '9999';
+            frame.style.border = 'none';
+            frame.style.height = '85px';
+            frame.style.background = 'transparent';
+        }}
+        layoutChatFrame();
+        window.addEventListener('resize', layoutChatFrame);
+
+        const input = document.getElementById('gemini-input');
+        const micIcon = document.getElementById('mic-icon');
+        const sendIcon = document.getElementById('send-icon');
+
+        input.addEventListener('input', () => {{
+            if (input.value.trim().length > 0) {{
+                micIcon.style.display = 'none';
+                sendIcon.style.display = 'flex';
+            }} else {{
+                micIcon.style.display = 'flex';
+                sendIcon.style.display = 'none';
+            }}
+        }});
+
+        function submitToStreamlit() {{
+            const text = input.value.trim();
+            if (!text) return;
+            const stTextArea = window.parent.document.querySelector('textarea[data-testid="stChatInputTextArea"]');
+            if (stTextArea) {{
+                let nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+                nativeInputValueSetter.call(stTextArea, text);
+                stTextArea.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                stTextArea.dispatchEvent(new KeyboardEvent('keydown', {{
+                    key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+                }}));
+                input.value = '';
+                micIcon.style.display = 'flex';
+                sendIcon.style.display = 'none';
+            }}
+        }}
+
+        sendIcon.addEventListener('click', submitToStreamlit);
+        input.addEventListener('keydown', (e) => {{
+            if (e.key === 'Enter') submitToStreamlit();
+        }});
+
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        micIcon.addEventListener('click', async () => {{
+            if (!isRecording) {{
+                try {{
+                    const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+                    mediaRecorder = new MediaRecorder(stream);
+                    mediaRecorder.start();
+                    isRecording = true;
+                    micIcon.classList.add('recording');
+                    input.placeholder = "Đang lắng nghe... (Nhấn lại mic để dừng)";
+
+                    mediaRecorder.addEventListener("dataavailable", event => {{
+                        audioChunks.push(event.data);
+                    }});
+
+                    mediaRecorder.addEventListener("stop", async () => {{
+                        input.placeholder = "Đang dịch giọng nói sang văn bản...";
+                        const audioBlob = new Blob(audioChunks, {{ type: 'audio/webm' }});
+                        audioChunks = [];
+                        stream.getTracks().forEach(track => track.stop());
+
+                        const formData = new FormData();
+                        formData.append('file', audioBlob, 'audio.webm');
+                        formData.append('model', 'whisper-large-v3-turbo');
+
+                        try {{
+                            const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {{
+                                method: 'POST',
+                                headers: {{ 'Authorization': `Bearer ${{GROQ_API_KEY}}` }},
+                                body: formData
+                            }});
+                            const data = await response.json();
+
+                            if (data.text) {{
+                                input.value = data.text;
+                                input.dispatchEvent(new Event('input'));
+                            }}
+                        }} catch (e) {{
+                            console.error("Lỗi Whisper API:", e);
+                            alert("Có lỗi xảy ra khi nhận diện giọng nói.");
+                        }} finally {{
+                            input.placeholder = "Ask Gemini 3";
+                        }}
+                    }});
+                }} catch (err) {{
+                    console.error("Lỗi truy cập Micro:", err);
+                    alert("Vui lòng cấp quyền truy cập Micro trên trình duyệt để sử dụng tính năng này!");
+                }}
+            }} else {{
+                mediaRecorder.stop();
+                isRecording = false;
+                micIcon.classList.remove('recording');
+            }}
+        }});
+    </script>
+</body>
+</html>
+"""
+components.html(custom_chat_html, height=85)
+
+user_query = None
+
+if text_query:
+    user_query = text_query
+
+# === TIẾP TỤC LUỒNG RAG HIỆN TẠI ===
+# === TIẾP TỤC LUỒNG RAG HIỆN TẠI ===
 if user_query:
-    with st.chat_message("user", avatar="👤"): st.markdown(user_query)
-    st.session_state.history.append(("user", user_query))
-    st.session_state.api_tokens = 0 
+    # [THÊM DÒNG NÀY]: Ép mọi câu trả lời mới xuất hiện ở phía trên thanh chat
+    with chat_container: 
+        
+        with st.chat_message("user", avatar="👤"): 
+            st.markdown(user_query)
+        st.session_state.history.append(("user", user_query))
+        st.session_state.api_tokens = 0 
+        
+        # Auto notify sales via email when user sends booking/contact lead info.
+        is_lead, lead_payload = detect_booking_lead(user_query)
+        if is_lead:
+            viewed_machines = st.session_state.viewed_machines or extract_viewed_machines(st.session_state.last_docs)
+            recent_user_questions = collect_recent_user_questions(user_query)
+            interest_area = infer_interest_area(" | ".join(recent_user_questions), st.session_state.last_docs)
+            lead_payload["interest_area"] = interest_area
+            lead_payload["viewed_machine_codes"] = extract_machine_codes(viewed_machines)
+            lead_payload["interest_summary"] = build_interest_summary(recent_user_questions, user_query, interest_area)
 
-    # Auto notify sales via email when user sends booking/contact lead info.
-    is_lead, lead_payload = detect_booking_lead(user_query)
-    if is_lead:
-        viewed_machines = st.session_state.viewed_machines or extract_viewed_machines(st.session_state.last_docs)
-        recent_user_questions = collect_recent_user_questions(user_query)
-        interest_area = infer_interest_area(" | ".join(recent_user_questions), st.session_state.last_docs)
-        lead_payload["interest_area"] = interest_area
-        lead_payload["viewed_machine_codes"] = extract_machine_codes(viewed_machines)
-        lead_payload["interest_summary"] = build_interest_summary(recent_user_questions, user_query, interest_area)
-
-        lead_key = make_query_cache_key(
-            f"{lead_payload.get('phone', '')}|{lead_payload.get('email', '')}|{lead_payload.get('content', '')[:120]}"
-        )
-        ok, err = (True, "")
-        if lead_key not in st.session_state.sent_booking_keys:
-            ok, err = send_sale_email(lead_payload)
-            if ok:
-                st.session_state.sent_booking_keys.add(lead_key)
-                st.toast("Đã gửi thông tin đặt lịch cho nhân viên sales.", icon="✅")
-            else:
-                st.toast(f"Gửi email lead thất bại: {err}", icon="⚠️")
-        booking_ack = build_booking_ack(lead_payload, ok, err)
-        with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-            st.markdown(booking_ack, unsafe_allow_html=True)
-        st.session_state.history.append(("assistant", booking_ack))
-        st.caption("⏱ Phản hồi: **0.00s** | 🎯 Phân tích: `booking_lead` | 🪙 Token: **0**")
-        st.stop()
-
-    has_context_dependency = is_context_dependent_query(user_query)
-    turn_history = st.session_state.history[:-1] if has_context_dependency else []
-    use_contextual_cache = not has_context_dependency
-    cache_key = make_query_cache_key(user_query)
-    cached_item = st.session_state.qa_cache.get(cache_key) if use_contextual_cache else None
-    if cached_item:
-        cached_answer = cached_item.get("answer", "")
-        cached_intent = cached_item.get("intent", "normal_rag")
-        with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-            st.markdown(cached_answer, unsafe_allow_html=True)
-        st.session_state.history.append(("assistant", cached_answer))
-        if cached_intent in st.session_state.intent_counts:
-            st.session_state.intent_counts[cached_intent] += 1
-        st.caption(f"⏱ Phản hồi: **0.00s** | 🎯 Phân tích: `{cached_intent}` | 🪙 Token: **0** | ⚡ Cache hit")
-        st.stop()
-
-    # Lấy API Key động dựa trên Model
-    groq_api_key = get_safe_api_key("GROQ_API_KEY")
-    openai_api_key = get_safe_api_key("OPENAI_API_KEY")
-
-    # Setup LLM Main (Chuyển đổi linh hoạt giữa OpenAI và Groq)
-    if selected_model in ["gpt-4o", "gpt-3.5-turbo"]:
-        if not openai_api_key:
-            st.error("⚠️ Không tìm thấy OPENAI_API_KEY. Vui lòng thêm vào file .env!")
+            lead_key = make_query_cache_key(
+                f"{lead_payload.get('phone', '')}|{lead_payload.get('email', '')}|{lead_payload.get('content', '')[:120]}"
+            )
+            ok, err = (True, "")
+            if lead_key not in st.session_state.sent_booking_keys:
+                ok, err = send_sale_email(lead_payload)
+                if ok:
+                    st.session_state.sent_booking_keys.add(lead_key)
+                    st.toast("Đã gửi thông tin đặt lịch cho nhân viên sales.", icon="✅")
+                else:
+                    st.toast(f"Gửi email lead thất bại: {err}", icon="⚠️")
+            booking_ack = build_booking_ack(lead_payload, ok, err)
+            with st.chat_message("assistant", avatar="img/logo_2.jpg"):
+                st.markdown(booking_ack, unsafe_allow_html=True)
+            st.session_state.history.append(("assistant", booking_ack))
+            st.caption("⏱ Phản hồi: **0.00s** | 🎯 Phân tích: `booking_lead` | 🪙 Token: **0**")
             st.stop()
-        llm_main = ChatOpenAI(
-            model_name=selected_model,
-            temperature=temperature,
-            openai_api_key=openai_api_key,
-            stream_usage=True,
-            max_tokens=3000,
-        )
-    else:
+
+        has_context_dependency = is_context_dependent_query(user_query)
+        turn_history = st.session_state.history[:-1] if has_context_dependency else []
+        use_contextual_cache = not has_context_dependency
+        cache_key = make_query_cache_key(user_query)
+        cached_item = st.session_state.qa_cache.get(cache_key) if use_contextual_cache else None
+        if cached_item:
+            cached_answer = cached_item.get("answer", "")
+            cached_intent = cached_item.get("intent", "normal_rag")
+            with st.chat_message("assistant", avatar="img/logo_2.jpg"):
+                st.markdown(cached_answer, unsafe_allow_html=True)
+            st.session_state.history.append(("assistant", cached_answer))
+            if cached_intent in st.session_state.intent_counts:
+                st.session_state.intent_counts[cached_intent] += 1
+            st.caption(f"⏱ Phản hồi: **0.00s** | 🎯 Phân tích: `{cached_intent}` | 🪙 Token: **0** | ⚡ Cache hit")
+            st.stop()
+
+        # Lấy API Key động dựa trên Model
+        groq_api_key = get_safe_api_key("GROQ_API_KEY")
+
+        # Setup LLM Main (Chuyển đổi linh hoạt giữa OpenAI và Groq)
         if not groq_api_key:
             st.error("⚠️ Không tìm thấy GROQ_API_KEY cho model Groq đã chọn.")
             st.stop()
@@ -1683,253 +2003,256 @@ if user_query:
             groq_api_key=groq_api_key,
             max_tokens=3000,
         )
-    
-    start = time.perf_counter()
-    history_limit = get_history_limit_for_model(selected_model)
-    llm_decision = build_decision_llm(groq_api_key, openai_api_key, llm_main)
-    intent_label = llm_classify_intent(user_query, llm_decision or llm_main, turn_history)
-    decision = RouterDecision(
-        intent=intent_label,
-        use_rag=(intent_label in ["find_machine", "book_knowledge", "solution_consulting"]),
-        reset_focus=(intent_label == "find_machine")
-    )
-    decision = apply_router_guards(user_query, decision)
+        
+        start = time.perf_counter()
+        history_limit = get_history_limit_for_model(selected_model)
+        llm_decision = build_decision_llm(groq_api_key, llm_main)
+        intent_label = llm_classify_intent(user_query, llm_decision or llm_main, turn_history)
+        decision = RouterDecision(
+            intent=intent_label,
+            use_rag=(intent_label in ["find_machine", "book_knowledge", "solution_consulting"]),
+            reset_focus=(intent_label == "find_machine")
+        )
+        decision = apply_router_guards(user_query, decision)
 
-    if decision.reset_focus:
-        st.session_state.last_docs = []
-    if decision.intent in st.session_state.intent_counts:
-        st.session_state.intent_counts[decision.intent] += 1
+        if decision.reset_focus:
+            st.session_state.last_docs = []
+        if decision.intent in st.session_state.intent_counts:
+            st.session_state.intent_counts[decision.intent] += 1
 
-    try:
-        raw_answer = ""
-        if decision.intent == "book_knowledge":
-            with thinking_indicator():
-                # NÂNG CẤP: Sử dụng RRF Retrieval để lấy kiến thức chính xác hơn,
-                # tránh LLM bịa thông tin khi context rỗng.
-                docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=10)
-            
-            if not docs:
-                # FALLBACK: Nếu không tìm thấy tài liệu trong cẩm nang, dùng kiến thức chung của LLM
-                messages = build_general_knowledge_fallback_messages(user_query, turn_history, history_limit)
-                with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-                    raw_answer = custom_write_stream(stream_response(messages, llm_main))
-            else:
-                # RAG BÌNH THƯỜNG: Nếu có tài liệu
-                context = format_book_context(docs)
-                messages = build_book_rag_messages(user_query, context, turn_history, history_limit)
-                with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-                    raw_answer = custom_write_stream(stream_response(messages, llm_main))
-
-        elif decision.intent == "solution_consulting":
-            with thinking_indicator():
-                # --- BƯỚC 1: Bóc tách yêu cầu ---
-                requirement = parse_consulting_request(user_query, turn_history, llm_main)
-                
-                # --- BƯỚC 2: Truy hồi kiến thức Cẩm nang (Luôn cần để làm nền) ---
-                book_docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=4)
-                book_context = format_book_context(book_docs)
-                
-                # --- BƯỚC 3: LUÔN LUÔN TÌM MÁY DÙ THÔNG TIN MỜ MỊT HAY RÕ RÀNG ---
-                machine_docs = []
-                machine_context = ""
-                
-                # TÍNH TOÁN DYNAMIC TOP-K
-                # Nếu đã rõ ràng -> Chỉ chốt 1 máy tối ưu nhất cho mỗi công đoạn.
-                # Nếu còn mù mờ -> Đưa ra 2-3 máy để khách tham khảo các phân khúc.
-                dynamic_top_k = 1 if requirement.is_clear else 3
-                
-                for keyword in requirement.search_keywords:
-                    process_docs = semantic_machine_search(
-                        user_query=keyword,
-                        vector_retriever=machine_vector_retriever,
-                        top_k=6, # Vẫn lấy pool rộng để lọc
-                        llm_main=None,
-                        target_format=requirement.material_format,
-                        target_scale=requirement.production_scale
-                    )
-                    process_docs = deduplicate_docs(process_docs)
-                    
-                    # Truyền dynamic_top_k vào hàm Rerank
-                    top_process_docs = rerank_machine_candidates(keyword, process_docs, llm_main, top_k=dynamic_top_k)
-                    
-                    if top_process_docs:
-                        machine_docs.extend(top_process_docs)
-                        machine_context += f"\n--- MÁY TÌM ĐƯỢC CHO: {keyword.upper()} ---\n"
-                        machine_context += format_context(top_process_docs)
-
-                # --- BƯỚC 4: Rẽ nhánh Prompt dựa trên độ rõ ràng của yêu cầu ---
-                if not requirement.is_clear:
-                    # TÌNH HUỐNG A: Yêu cầu mù mờ -> Hỏi lại, nhưng có thể dùng máy đã tìm được làm VÍ DỤ
-                    sys_prompt = f"""Bạn là chuyên gia tư vấn giải pháp của VPRINT.
-                    Khách hàng đang nhờ tư vấn, nhưng thông tin quá chung chung.
-                    Phân tích hệ thống cho thấy ta đang thiếu: {', '.join(requirement.missing_info)}
-                    
-                    Nhiệm vụ:
-                    1. Tuyệt đối KHÔNG đề xuất bừa một model máy cụ thể nào ở bước này.
-                    2. Dựa vào [CẨM NANG] và [VÍ DỤ MÁY], giải thích nhẹ nhàng cho khách hiểu tại sao việc xác định các yếu tố trên (như vật liệu, sản lượng) lại quan trọng để chọn đúng máy.
-                    3. Đặt 2-3 câu hỏi ngắn gọn, lịch sự để khách hàng cung cấp thêm thông tin.
-                    
-                    [VÍ DỤ MÁY]:
-                    {machine_context if machine_context else "Chưa tìm thấy máy ví dụ phù hợp."}
-
-                    [CẨM NANG NGÀNH IN]:
-                    {book_context}
-                    """
-                    messages = [("system", sys_prompt)] + get_optimized_history(turn_history, history_limit) + [("user", user_query)]
-                
-                else:
-                    # TÌNH HUỐNG B: Yêu cầu đã rõ -> Trình bày giải pháp
-                    # Lọc trùng lặp nếu có máy đa năng (VD: vừa in vừa bế)
-                    machine_docs = deduplicate_docs(machine_docs)
-                    
-                    # Prompt tổng hợp cuối cùng
-                    sys_prompt = f"""Bạn là Kỹ sư trưởng tư vấn giải pháp dây chuyền của VPRINT.
-                    Khách hàng muốn làm sản phẩm: {requirement.product_type}.
-                    Hệ thống đề xuất quy trình gồm: {', '.join(requirement.suggested_processes)}.
-                    
-                    Nhiệm vụ:
-                    1. Nêu tóm tắt workflow.
-                    2. Đề xuất máy. TUYỆT ĐỐI KHÔNG chọn máy cuộn (web-fed) cho vật liệu tờ rời (sheet-fed) và ngược lại.
-                    3. QUAN TRỌNG: Lập một bảng đánh giá sự đồng bộ về Tốc độ/Năng suất của dây chuyền (Dựa vào thông số tốc độ của các máy đề xuất). Chỉ ra đâu có thể là nút thắt cổ chai (bottleneck) nếu chạy thực tế.
-                    4. Chỉ dùng máy trong kho, nếu kho thiếu máy cho công đoạn nào, hãy báo rõ "VPRINT hiện chưa cập nhật dòng máy này trên hệ thống online".
-                    5. Dùng [CẨM NANG] để giải thích thêm (nếu cần thiết) tại sao công nghệ/máy đó lại phù hợp với sản phẩm của khách.
-                    
-                    [KHO MÁY VPRINT LỌC THEO CÔNG ĐOẠN]:
-                    {machine_context}
-                    
-                    [CẨM NANG NGÀNH IN]:
-                    {book_context}
-                    """
-                    messages = [("system", sys_prompt)] + get_optimized_history(turn_history, history_limit) + [("user", user_query)]
-
-                # --- BƯỚC 4: Generate Output ---
-                with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-                    raw_answer = custom_write_stream(stream_response(messages, llm_main))
-                
-                if machine_docs:
-                    st.session_state.last_docs = machine_docs
-                    track_viewed_machines(machine_docs[:3])
-
-        elif decision.intent == "find_machine":
-            with thinking_indicator():
-                # Xử lý tham chiếu: Nếu đang hỏi tiếp về máy cũ (VD: "Máy này...") -> Gắn tên máy vào query
-                search_query = user_query
-                if has_context_dependency and st.session_state.last_docs:
-                    last_machine_name = st.session_state.last_docs[0].metadata.get("name", "")
-                    q_norm = normalize_for_match(user_query)
-                    
-                    # Chỉ nối tên máy cũ vào nếu câu hỏi HIỆN TẠI KHÔNG có từ khóa tìm loại máy MỚI
-                    new_machine_keywords = ["may in", "may be", "may dan", "may can", "may ep", "may ghi"]
-                    is_asking_new_machine = any(k in q_norm for k in new_machine_keywords)
-                    
-                    if last_machine_name and not is_asking_new_machine:
-                        search_query = f"{user_query} ({last_machine_name})"
-
-                filtered_docs = semantic_machine_search(
-                    search_query,
-                    machine_vector_retriever,
-                    SEARCH_POOL_K,
-                    llm_main,
-                )
-                filtered_docs = deduplicate_docs(filtered_docs)[:SEARCH_POOL_K]
-
-            # TÍNH TOÁN DYNAMIC TOP-K CHO TÌM KIẾM TRỰC TIẾP
-            q_norm = normalize_for_match(user_query)
-            # Kiểm tra xem có số (thể hiện model/thông số) hoặc câu hỏi mô tả dài không
-            has_specs = bool(re.search(r'\d+', q_norm)) 
-            is_detailed = len(user_query.split()) > 7
-            
-            dynamic_top_k = 1 if (has_specs or is_detailed) else 3
-
-            # Gọi Rerank với Top-K động
-            suggested_docs = rerank_machine_candidates(
-                user_query=user_query,
-                candidate_docs=filtered_docs,
-                llm_main=llm_main,
-                top_k=dynamic_top_k, 
-            )
-
-            if not suggested_docs:
-                raw_answer = "Xin lỗi, tôi chưa tìm thấy máy phù hợp trong kho dữ liệu hiện tại của VPRINT."
-                with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-                    st.markdown(raw_answer, unsafe_allow_html=True)
-            else:
-                track_viewed_machines(suggested_docs)
-                
-                # Sửa câu chào dựa trên số lượng máy
-                if len(suggested_docs) == 1:
-                    raw_answer = "👋 Dựa trên thông số chi tiết bạn cung cấp, đây là cấu hình máy tối ưu nhất:\n\n"
-                else:
-                    raw_answer = "👋 Để bạn dễ hình dung, VPRINT xin gợi ý một vài dòng máy phù hợp với các phân khúc khác nhau:\n\n"
-                
-                is_spec_request = any(k in normalize_for_match(user_query) for k in ["thong so", "cau hinh", "spec", "ky thuat", "chi tiet"])
-
+        try:
+            raw_answer = ""
+            language_instruction = get_response_language_instruction(user_query)
+            if decision.intent == "book_knowledge":
                 with thinking_indicator():
-                    machine_summaries = summarize_machines_structured(user_query, suggested_docs, llm_main)
+                    # NÂNG CẤP: Sử dụng RRF Retrieval để lấy kiến thức chính xác hơn,
+                    # tránh LLM bịa thông tin khi context rỗng.
+                    docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=10)
+                
+                if not docs:
+                    # FALLBACK: Nếu không tìm thấy tài liệu trong cẩm nang, dùng kiến thức chung của LLM
+                    messages = build_general_knowledge_fallback_messages(user_query, turn_history, history_limit)
+                    with st.chat_message("assistant", avatar="img/logo_2.jpg"):
+                        raw_answer = custom_write_stream(stream_response(messages, llm_main))
+                else:
+                    # RAG BÌNH THƯỜNG: Nếu có tài liệu
+                    context = format_book_context(docs)
+                    messages = build_book_rag_messages(user_query, context, turn_history, history_limit)
+                    with st.chat_message("assistant", avatar="img/logo_2.jpg"):
+                        raw_answer = custom_write_stream(stream_response(messages, llm_main))
 
+            elif decision.intent == "solution_consulting":
+                with thinking_indicator():
+                    # --- BƯỚC 1: Bóc tách yêu cầu ---
+                    requirement = parse_consulting_request(user_query, turn_history, llm_main)
+                    
+                    # --- BƯỚC 2: Truy hồi kiến thức Cẩm nang (Luôn cần để làm nền) ---
+                    book_docs = retrieve_book_with_rrf(user_query, book_retriever, llm_main, top_k=4)
+                    book_context = format_book_context(book_docs)
+                    
+                    # --- BƯỚC 3: LUÔN LUÔN TÌM MÁY DÙ THÔNG TIN MỜ MỊT HAY RÕ RÀNG ---
+                    machine_docs = []
+                    machine_context = ""
+                    
+                    # TÍNH TOÁN DYNAMIC TOP-K
+                    # Nếu đã rõ ràng -> Chỉ chốt 1 máy tối ưu nhất cho mỗi công đoạn.
+                    # Nếu còn mù mờ -> Đưa ra 2-3 máy để khách tham khảo các phân khúc.
+                    dynamic_top_k = 3
+                    
+                    for keyword in requirement.search_keywords:
+                        process_docs = semantic_machine_search(
+                            user_query=keyword,
+                            vector_retriever=machine_vector_retriever,
+                            top_k=6, # Vẫn lấy pool rộng để lọc
+                            llm_main=None,
+                            target_format=requirement.material_format,
+                            target_scale=requirement.production_scale
+                        )
+                        process_docs = deduplicate_docs(process_docs)
+                        
+                        # Truyền dynamic_top_k vào hàm Rerank
+                        top_process_docs = rerank_machine_candidates(keyword, process_docs, llm_main, top_k=dynamic_top_k)
+                        
+                        if top_process_docs:
+                            machine_docs.extend(top_process_docs)
+                            machine_context += f"\n--- MÁY TÌM ĐƯỢC CHO: {keyword.upper()} ---\n"
+                            machine_context += format_context(top_process_docs)
+
+                    # --- BƯỚC 4: Rẽ nhánh Prompt dựa trên độ rõ ràng của yêu cầu ---
+                    if not requirement.is_clear:
+                        # TÌNH HUỐNG A: Yêu cầu mù mờ -> Hỏi lại, nhưng có thể dùng máy đã tìm được làm VÍ DỤ
+                        sys_prompt = f"""Bạn là chuyên gia tư vấn giải pháp của VPRINT.
+                        Khách hàng đang nhờ tư vấn, nhưng thông tin quá chung chung.
+                        Phân tích hệ thống cho thấy ta đang thiếu: {', '.join(requirement.missing_info)}
+                        {language_instruction}
+                        
+                        Nhiệm vụ:
+                        1. Tuyệt đối KHÔNG đề xuất bừa một model máy cụ thể nào ở bước này.
+                        2. Dựa vào [CẨM NANG] và [VÍ DỤ MÁY], giải thích nhẹ nhàng cho khách hiểu tại sao việc xác định các yếu tố trên (như vật liệu, sản lượng) lại quan trọng để chọn đúng máy.
+                        3. Đặt 2-3 câu hỏi ngắn gọn, lịch sự để khách hàng cung cấp thêm thông tin.
+                        
+                        [VÍ DỤ MÁY]:
+                        {machine_context if machine_context else "Chưa tìm thấy máy ví dụ phù hợp."}
+
+                        [CẨM NANG NGÀNH IN]:
+                        {book_context}
+                        """
+                        messages = [("system", sys_prompt)] + get_optimized_history(turn_history, history_limit) + [("user", user_query)]
+                    
+                    else:
+                        # TÌNH HUỐNG B: Yêu cầu đã rõ -> Trình bày giải pháp
+                        # Lọc trùng lặp nếu có máy đa năng (VD: vừa in vừa bế)
+                        machine_docs = deduplicate_docs(machine_docs)
+                        
+                        # Prompt tổng hợp cuối cùng
+                        sys_prompt = f"""Bạn là Kỹ sư trưởng tư vấn giải pháp dây chuyền của VPRINT.
+                        Khách hàng muốn làm sản phẩm: {requirement.product_type}.
+                        Hệ thống đề xuất quy trình gồm: {', '.join(requirement.suggested_processes)}.
+                        {language_instruction}
+                        
+                        Nhiệm vụ:
+                        1. Nêu tóm tắt workflow.
+                        2. Đề xuất máy. TUYỆT ĐỐI KHÔNG chọn máy cuộn (web-fed) cho vật liệu tờ rời (sheet-fed) và ngược lại.
+                        3. QUAN TRỌNG: Lập một bảng đánh giá sự đồng bộ về Tốc độ/Năng suất của dây chuyền (Dựa vào thông số tốc độ của các máy đề xuất). Chỉ ra đâu có thể là nút thắt cổ chai (bottleneck) nếu chạy thực tế.
+                        4. Chỉ dùng máy trong kho, nếu kho thiếu máy cho công đoạn nào, hãy báo rõ "VPRINT hiện chưa cập nhật dòng máy này trên hệ thống online".
+                        5. Dùng [CẨM NANG] để giải thích thêm (nếu cần thiết) tại sao công nghệ/máy đó lại phù hợp với sản phẩm của khách.
+                        
+                        [KHO MÁY VPRINT LỌC THEO CÔNG ĐOẠN]:
+                        {machine_context}
+                        
+                        [CẨM NANG NGÀNH IN]:
+                        {book_context}
+                        """
+                        messages = [("system", sys_prompt)] + get_optimized_history(turn_history, history_limit) + [("user", user_query)]
+
+                    # --- BƯỚC 4: Generate Output ---
+                    with st.chat_message("assistant", avatar="img/logo_2.jpg"):
+                        raw_answer = custom_write_stream(stream_response(messages, llm_main))
+                    
+                    if machine_docs:
+                        st.session_state.last_docs = machine_docs
+                        track_viewed_machines(machine_docs[:3])
+
+            elif decision.intent == "find_machine":
+                with thinking_indicator():
+                    # Xử lý tham chiếu: Nếu đang hỏi tiếp về máy cũ (VD: "Máy này...") -> Gắn tên máy vào query
+                    search_query = user_query
+                    if has_context_dependency and st.session_state.last_docs:
+                        last_machine_name = st.session_state.last_docs[0].metadata.get("name", "")
+                        q_norm = normalize_for_match(user_query)
+                        
+                        # Chỉ nối tên máy cũ vào nếu câu hỏi HIỆN TẠI KHÔNG có từ khóa tìm loại máy MỚI
+                        new_machine_keywords = ["may in", "may be", "may dan", "may can", "may ep", "may ghi"]
+                        is_asking_new_machine = any(k in q_norm for k in new_machine_keywords)
+                        
+                        if last_machine_name and not is_asking_new_machine:
+                            search_query = f"{user_query} ({last_machine_name})"
+
+                    filtered_docs = semantic_machine_search(
+                        search_query,
+                        machine_vector_retriever,
+                        SEARCH_POOL_K,
+                        llm_main,
+                    )
+                    filtered_docs = deduplicate_docs(filtered_docs)[:SEARCH_POOL_K]
+
+                # TÍNH TOÁN DYNAMIC TOP-K CHO TÌM KIẾM TRỰC TIẾP
+                q_norm = normalize_for_match(user_query)
+                # Kiểm tra xem có số (thể hiện model/thông số) hoặc câu hỏi mô tả dài không
+                has_specs = bool(re.search(r'\d+', q_norm)) 
+                is_detailed = len(user_query.split()) > 7
+                
+                dynamic_top_k = 3
+
+                # Gọi Rerank với Top-K động
+                suggested_docs = rerank_machine_candidates(
+                    user_query=user_query,
+                    candidate_docs=filtered_docs,
+                    llm_main=llm_main,
+                    top_k=dynamic_top_k, 
+                )
+
+                if not suggested_docs:
+                    raw_answer = "Xin lỗi, tôi chưa tìm thấy máy phù hợp trong kho dữ liệu hiện tại của VPRINT."
+                    with st.chat_message("assistant", avatar="img/logo_2.jpg"):
+                        st.markdown(raw_answer, unsafe_allow_html=True)
+                else:
+                    track_viewed_machines(suggested_docs)
+                    
+                    # Sửa câu chào dựa trên số lượng máy
+                    if len(suggested_docs) == 1:
+                        raw_answer = "👋 Dựa trên thông số chi tiết bạn cung cấp, đây là cấu hình máy tối ưu nhất:\n\n"
+                    else:
+                        raw_answer = "👋 Để bạn dễ hình dung, VPRINT xin gợi ý một vài dòng máy phù hợp với các phân khúc khác nhau:\n\n"
+                    
+                    is_spec_request = any(k in normalize_for_match(user_query) for k in ["thong so", "cau hinh", "spec", "ky thuat", "chi tiet"])
+
+                    with thinking_indicator():
+                        machine_summaries = summarize_machines_structured(user_query, suggested_docs, llm_main)
+
+                    with st.chat_message("assistant", avatar="img/logo_2.jpg"):
+                        display_container = st.empty()
+                        for i, doc in enumerate(suggested_docs):
+                            name = doc.metadata.get("name", f"Sản phẩm {i+1}")
+                            url = doc.metadata.get("product_url", "")
+                            imgs = parse_images(doc.metadata.get("images", ""))
+                            if len(suggested_docs) > 1:
+                                raw_answer += f"### 🏆 Top {i+1}: **{name}**\n"
+                            else:
+                                raw_answer += f"### 🏆 **{name}**\n"
+                            if imgs:
+                                img_html = "".join(
+                                    [f'<img src="{img}" style="height:140px;margin-right:8px;border-radius:8px;border:1px solid #ddd;object-fit:contain;">' for img in imgs[:3]]
+                                )
+                                raw_answer += f"<div>{img_html}</div><br>\n\n"
+
+                            if i < len(machine_summaries):
+                                s = machine_summaries[i]
+                                
+                                # Trích xuất chuỗi JSON gốc từ page_content thay vì dùng s.performance đã bị cắt cụt
+                                specs_json_str = extract_labeled_value(doc.page_content, "Specifications")
+                                
+                                # Render thành bảng Markdown
+                                formatted_performance = format_specs_to_json_table(specs_json_str)
+
+                                raw_answer += (
+                                    f"- **Mô tả:** {s.description}\n"
+                                    f"**📊 Tốc độ / Hiệu suất:**\n\n{formatted_performance}\n\n"
+                                    f"- **Công nghệ:** {s.technology}\n"
+                                    f"- **Điểm ưu việt:** {s.advantage}\n\n"
+                                )
+
+                            raw_answer += "---\n\n"
+                            # Cập nhật UI ngay lập tức sau mỗi máy để người dùng không phải chờ
+                            display_container.markdown(raw_answer, unsafe_allow_html=True)
+                    st.session_state.last_docs = suggested_docs
+
+            else:
+                with thinking_indicator():
+                    messages = build_direct_messages(user_query, turn_history, history_limit)
                 with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-                    display_container = st.empty()
-                    for i, doc in enumerate(suggested_docs):
-                        name = doc.metadata.get("name", f"Sản phẩm {i+1}")
-                        url = doc.metadata.get("product_url", "")
-                        imgs = parse_images(doc.metadata.get("images", ""))
-                        if len(suggested_docs) > 1:
-                            raw_answer += f"### 🏆 Top {i+1}: **[{name}]({url})**\n"
-                        else:
-                            raw_answer += f"### 🏆 **[{name}]({url})**\n"
-                        if imgs:
-                            img_html = "".join(
-                                [f'<img src="{img}" style="height:140px;margin-right:8px;border-radius:8px;border:1px solid #ddd;object-fit:contain;">' for img in imgs[:3]]
-                            )
-                            raw_answer += f"<div>{img_html}</div><br>\n\n"
+                    raw_answer = custom_write_stream(stream_response(messages, llm_main))
 
-                        if i < len(machine_summaries):
-                            s = machine_summaries[i]
-                            
-                            # Trích xuất chuỗi JSON gốc từ page_content thay vì dùng s.performance đã bị cắt cụt
-                            specs_json_str = extract_labeled_value(doc.page_content, "Specifications")
-                            
-                            # Render thành bảng Markdown
-                            formatted_performance = format_specs_to_json_table(specs_json_str)
+            if raw_answer:
+                if not raw_answer.startswith("⚠️"):
+                    st.session_state.qa_cache[cache_key] = {
+                        "answer": raw_answer,
+                        "intent": decision.intent,
+                    }
+                st.session_state.history.append(("assistant", raw_answer))
+                
+                tokens_used = st.session_state.api_tokens
+                if tokens_used == 0: tokens_used = (len(str(user_query)) + len(str(raw_answer))) // 3
+                
+                st.session_state.total_session_tokens += tokens_used
+                process_time = time.perf_counter() - start
+                
+                log_chat_to_gsheet_async(user_query, raw_answer, decision.intent, process_time, tokens_used, selected_model)
 
-                            raw_answer += (
-                                f"- **Mô tả:** {s.description}\n"
-                                f"**📊 Tốc độ / Hiệu suất:**\n\n{formatted_performance}\n\n"
-                                f"- **Công nghệ:** {s.technology}\n"
-                                f"- **Điểm ưu việt:** {s.advantage}\n\n"
-                            )
+        except Exception as e:
+            error_msg = f"⚠️ Hệ thống AI đang bận. Vui lòng thử lại! (Chi tiết: {str(e)})"
+            with st.chat_message("assistant", avatar="img/logo_2.jpg"): st.markdown(error_msg)
+            st.session_state.history.append(("assistant", error_msg))
+            log_chat_to_gsheet_async(user_query, error_msg, decision.intent, 0, 0, selected_model)
 
-                        raw_answer += "---\n\n"
-                        # Cập nhật UI ngay lập tức sau mỗi máy để người dùng không phải chờ
-                        display_container.markdown(raw_answer, unsafe_allow_html=True)
-                st.session_state.last_docs = suggested_docs
-
-        else:
-            with thinking_indicator():
-                messages = build_direct_messages(user_query, turn_history, history_limit)
-            with st.chat_message("assistant", avatar="img/logo_2.jpg"):
-                raw_answer = custom_write_stream(stream_response(messages, llm_main))
-
-        if raw_answer:
-            if not raw_answer.startswith("⚠️"):
-                st.session_state.qa_cache[cache_key] = {
-                    "answer": raw_answer,
-                    "intent": decision.intent,
-                }
-            st.session_state.history.append(("assistant", raw_answer))
-            
-            tokens_used = st.session_state.api_tokens
-            if tokens_used == 0: tokens_used = (len(str(user_query)) + len(str(raw_answer))) // 3
-            
-            st.session_state.total_session_tokens += tokens_used
-            process_time = time.perf_counter() - start
-            
-            log_chat_to_gsheet_async(user_query, raw_answer, decision.intent, process_time, tokens_used, selected_model)
-
-    except Exception as e:
-        error_msg = f"⚠️ Hệ thống AI đang bận. Vui lòng thử lại! (Chi tiết: {str(e)})"
-        with st.chat_message("assistant", avatar="img/logo_2.jpg"): st.markdown(error_msg)
-        st.session_state.history.append(("assistant", error_msg))
-        log_chat_to_gsheet_async(user_query, error_msg, decision.intent, 0, 0, selected_model)
-
-    st.caption(f"⏱ Phản hồi: **{round(time.perf_counter() - start, 2)}s** | 🎯 Phân tích: `{decision.intent}` | 🪙 Token: **{st.session_state.api_tokens}**")
+        st.caption(f"⏱ Phản hồi: **{round(time.perf_counter() - start, 2)}s** | 🎯 Phân tích: `{decision.intent}` | 🪙 Token: **{st.session_state.api_tokens}**")
