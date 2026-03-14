@@ -4,7 +4,6 @@ import time
 import re
 import json
 import os
-import shutil
 import base64
 import torch
 import threading
@@ -48,22 +47,6 @@ from chatbot_vprint_hybrid_local import (
 # 1. CẤU HÌNH TRANG VÀ KHỞI TẠO SESSION STATE
 # ==========================================
 st.set_page_config(page_title="VPRINT AI", page_icon="img/logo_2.jpg", layout="wide")
-
-APP_VERSION = "1.0.2"
-FORCE_REBUILD_DB = False
-
-if st.session_state.get("app_version") != APP_VERSION:
-    st.session_state.clear()
-    st.session_state["app_version"] = APP_VERSION
-
-    # Cho phép ép xóa DB vector cũ khi cần rebuild lại embeddings từ đầu.
-    if FORCE_REBUILD_DB:
-        try:
-            if os.path.exists("vprint_machines_db_local"):
-                shutil.rmtree("vprint_machines_db_local")
-                print("Đã xóa Vector DB cũ để tạo lại!")
-        except Exception as e:
-            print(f"Lỗi khi xóa DB: {e}")
 
 if "initialized" not in st.session_state:
     st.session_state.history = []
@@ -1263,6 +1246,7 @@ Khách: "Kể chuyện ma đi"
 Bot: "Chuyện ma thì mình không rành, nhưng công nghệ UV hay ép kim trong ngành in thì mình khá chắc tay. Xưởng của bạn đang cần tư vấn dòng máy hay công nghệ nào?"
 
 Khách: "1+1 bằng mấy"
+
 Bot: "Dạ bằng 2 ạ. Nếu bạn cần tính chi phí đầu tư hoặc sản lượng cho dây chuyền in bao bì, mình hỗ trợ rất nhanh."
 -------------------
 """
@@ -1347,23 +1331,24 @@ Quy tắc:
 
 def build_troubleshooting_messages(user_query, qa_context, book_context, history, max_history=5):
     language_instruction = get_response_language_instruction(user_query)
-    sys_prompt = f"""Bạn là Kỹ sư Trưởng bộ phận Bảo hành & Bảo trì của VPRINT, với hơn 15 năm kinh nghiệm sửa chữa máy in công nghiệp.
+    sys_prompt = f"""Bạn là Kỹ sư Trưởng bộ phận Bảo hành & Bảo trì của VPRINT, đóng vai trò là một trợ lý AI thân thiện, chuyên nghiệp và giàu kinh nghiệm.
 Khách hàng đang gặp sự cố kỹ thuật và cần hỗ trợ khắc phục.
-{language_instruction}
 
-[SỔ TAY XỬ LÝ SỰ CỐ (Từ chuyên gia VPRINT)]:
+[SỔ TAY XỬ LÝ SỰ CỐ]:
 {qa_context}
 
-[LÝ THUYẾT VẬN HÀNH (Nếu cần tham khảo)]:
+[LÝ THUYẾT VẬN HÀNH (Tham khảo)]:
 {book_context}
 
-📝 QUY TẮC PHẢN HỒI BẮT BUỘC:
-1. Đồng cảm & Trấn an: Thể hiện sự hiểu biết về mức độ nghiêm trọng của lỗi (nhất là quá nhiệt, cháy chập).
-2. Phân tích nguyên nhân: Dựa vào [SỔ TAY XỬ LÝ SỰ CỐ] để liệt kê 2-3 nguyên nhân khả dĩ nhất.
-3. Hướng dẫn từng bước (Step-by-step): Đưa ra cách xử lý rõ ràng, theo thứ tự. Ưu tiên các bước an toàn trước (VD: Tắt nguồn, xả áp, làm mát...).
-4. Mở rộng linh hoạt: Nếu lỗi của khách không giống 100% trong sổ tay, kết hợp logic từ sổ tay + phân tích chuyên môn để suy luận cách xử lý an toàn nhất.
-5. Cảnh báo an toàn: Nếu lỗi nghiêm trọng (quá nhiệt, hỏng phần cứng), bắt buộc khuyên khách tạm ngưng máy và liên hệ ngay Hotline Kỹ thuật VPRINT để kỹ thuật viên xuống xưởng kiểm tra.
-6. Tuyệt đối không hướng dẫn khách tự tháo dỡ bo mạch hoặc can thiệp điện cao áp nếu không có chuyên môn.
+📝 PHONG CÁCH TRẢ LỜI (MÔ PHỎNG CHATBOT CHUYÊN NGHIỆP):
+1. Lời chào & Chẩn đoán tự nhiên: Bắt đầu bằng một câu chào thân thiện, thể hiện sự thấu hiểu và đưa ra phán đoán nhanh. 
+   -> Ví dụ: "Chào bạn, tình trạng máy bị [tên lỗi] có thể là do cặn bám hoặc nghẽn áp suất. Bạn có thể xem qua một vài nguyên nhân sau nhé..."
+2. Hướng dẫn từng bước mềm mại: Dùng các từ nối dẫn dắt mượt mà như "Đầu tiên, bạn hãy...", "Tiếp theo, thử kiểm tra...". Giữ các bước thật ngắn gọn, dễ hiểu (tối đa 3-4 bước).
+3. Chốt lại bằng sự nhiệt tình: Luôn kết thúc bằng một lời đề nghị hỗ trợ thêm. 
+   -> Ví dụ: "Nếu bạn đã thử các bước trên mà máy vẫn chưa ổn định, bạn cứ để lại số điện thoại tại đây nhé, kỹ thuật viên bên VPRINT sẽ liên hệ hỗ trợ trực tiếp cho xưởng mình!"
+4. TUYỆT ĐỐI KHÔNG DÙNG TIÊU ĐỀ RẬP KHUÔN: Không được sinh ra các từ như "1. Đồng cảm", "2. Phân tích", "3. Cảnh báo". Hãy viết thành một đoạn trò chuyện tự nhiên liền mạch.
+5. CẤM BỊA ĐẶT THÔNG TIN: Không tự bịa ra số hotline (như 1900 xxxx) hay email ảo. Chỉ hướng dẫn khách để lại SĐT trên khung chat.
+{language_instruction}
 """
     return [("system", sys_prompt)] + get_optimized_history(history, max_history) + [("user", user_query)]
 
@@ -1964,14 +1949,22 @@ def llm_classify_intent(user_query, llm_main, history=None):
         recent_history = "\n".join(recent_turns)
 
     system_prompt = """Bạn là bộ định tuyến (Semantic Router) thông minh nhất của VPRINT B2B Chatbot.
-Nhiệm vụ của bạn là đọc hiểu NGỮ NGHĨA (không chỉ so khớp từ khóa) câu hỏi của khách hàng và phân loại vào ĐÚNG 1 trong 6 nhãn sau:
+Nhiệm vụ của bạn là đọc hiểu NGỮ NGHĨA câu hỏi của khách hàng và phân loại vào ĐÚNG 1 trong 6 nhãn sau:
 
-1. out_of_scope: Tìm máy in cá nhân, văn phòng, gia đình, dịch vụ in lẻ.
-2. find_machine: Tìm kiếm, xin báo giá, xem thông số một dòng máy in/gia công CÔNG NGHIỆP cụ thể.
-3. book_knowledge: Hỏi lý thuyết, nguyên lý, định nghĩa, hoặc SO SÁNH các công nghệ ngành in (Việt/Anh).
-4. solution_consulting: Tư vấn mở xưởng, quy trình dây chuyền, đầu tư máy móc (chưa chốt dòng máy nào).
-5. troubleshooting: Hỏi xử lý sự cố/lỗi máy, lỗi vận hành, hiện tượng bất thường (kẹt giấy, lem mực, bệt màu, quá nhiệt, máy kêu to, lỗi cảm biến...).
-6. direct_chat: Chào hỏi, cảm ơn, tán gẫu.
+1. troubleshooting: Mọi câu hỏi nhờ hướng dẫn sửa chữa, bắt bệnh, báo lỗi, sự cố vận hành. LƯU Ý QUAN TRỌNG: Nếu khách nhắc đến "máy in phun" kèm theo lỗi (kẹt mực, nghẹt đầu phun...), HÃY MẶC ĐỊNH ĐÓ LÀ MÁY IN PHUN CÔNG NGHIỆP (UV) VÀ XẾP VÀO NHÃN NÀY, trừ khi khách nói rõ tên máy văn phòng (VD: Canon, Epson A4).
+2. out_of_scope: Tìm mua các loại máy KHÔNG CÓ TRONG NGÀNH IN CÔNG NGHIỆP. LƯU Ý: Chỉ xếp vào nhãn này nếu khách HỎI MUA máy in văn phòng/gia đình hoặc nhắc đích danh các dòng máy mini (Canon A4, HP Deskjet, máy in bill...).
+3. find_machine: Tìm kiếm, xin báo giá máy CÔNG NGHIỆP.
+4. book_knowledge: Hỏi lý thuyết, nguyên lý ngành in.
+5. solution_consulting: Tư vấn mở xưởng, dây chuyền.
+6. direct_chat: Chào hỏi, tán gẫu, đố vui.
+
+--- VÍ DỤ MẪU ---
+User: "Máy in phun của tôi bị kẹt mực"
+Nhãn: troubleshooting (Mặc định là lỗi máy in phun công nghiệp)
+
+User: "Canon 2900 của tôi kẹt giấy"
+Nhãn: out_of_scope (Vì Canon 2900 đích danh là máy văn phòng)
+
 
 --- VÍ DỤ MẪU (FEW-SHOT EXAMPLES) ---
 User: "Compare Plexo Printing with Digital Printing" (Khách gõ sai chữ Flexo)
@@ -2439,7 +2432,7 @@ custom_chat_html = f"""
                             console.error("Lỗi Whisper API:", e);
                             alert("Có lỗi xảy ra khi nhận diện giọng nói.");
                         }} finally {{
-                            input.placeholder = "Ask Gemini 3";
+                            input.placeholder = "Hỏi bất cứ điều gì với VprintAI";
                         }}
                     }});
                 }} catch (err) {{

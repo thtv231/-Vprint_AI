@@ -8,6 +8,7 @@ pandas
 plotly
 pytz
 pydantic
+PyYAML
 
 # === LangChain & AI Dependencies ===
 # Main LLM providers
@@ -28,4 +29,3 @@ langgraph
 rank_bm25
 torch
 sentence-transformers
-shutil
