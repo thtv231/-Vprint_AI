@@ -28,3 +28,4 @@ langgraph
 rank_bm25
 torch
 sentence-transformers
+shutil

@@ -4,6 +4,7 @@ import time
 import re
 import json
 import os
+import shutil
 import base64
 import torch
 import threading
@@ -47,6 +48,22 @@ from chatbot_vprint_hybrid_local import (
 # 1. CẤU HÌNH TRANG VÀ KHỞI TẠO SESSION STATE
 # ==========================================
 st.set_page_config(page_title="VPRINT AI", page_icon="img/logo_2.jpg", layout="wide")
+
+APP_VERSION = "1.0.2"
+FORCE_REBUILD_DB = False
+
+if st.session_state.get("app_version") != APP_VERSION:
+    st.session_state.clear()
+    st.session_state["app_version"] = APP_VERSION
+
+    # Cho phép ép xóa DB vector cũ khi cần rebuild lại embeddings từ đầu.
+    if FORCE_REBUILD_DB:
+        try:
+            if os.path.exists("vprint_machines_db_local"):
+                shutil.rmtree("vprint_machines_db_local")
+                print("Đã xóa Vector DB cũ để tạo lại!")
+        except Exception as e:
+            print(f"Lỗi khi xóa DB: {e}")
 
 if "initialized" not in st.session_state:
     st.session_state.history = []
