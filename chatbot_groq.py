@@ -76,45 +76,72 @@ if "viewed_machines" not in st.session_state:
 
 st.markdown("""
 <style>
-/* CSS cho Nút gợi ý */
+/* ── Nút gợi ý: chế độ sáng ──────────────────────────────── */
 div[data-testid="stVerticalBlock"] div.stButton > button {
-    background-color: #f3f4f6; color: #374151; border-radius: 20px; 
-    border: 1px solid #e5e7eb; padding: 8px 16px; font-size: 14.5px; 
-    font-weight: 500; transition: all 0.2s ease-in-out; text-align: left; 
-    width: 100%; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    border-radius: 20px;
+    padding: 8px 16px;
+    font-size: 14.5px;
+    font-weight: 500;
+    transition: all 0.2s ease-in-out;
+    text-align: left;
+    width: 100%;
+    /* dùng màu thích nghi với theme */
+    background-color: rgba(128,128,128,0.10);
+    color: var(--text-color, #374151);
+    border: 1px solid rgba(128,128,128,0.25);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
 }
 div[data-testid="stVerticalBlock"] div.stButton > button:hover {
-    background-color: #e5e7eb; border-color: #d1d5db; color: #000000;
-    transform: translateY(-1px); box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+    background-color: rgba(128,128,128,0.20);
+    border-color: rgba(128,128,128,0.40);
+    color: var(--text-color, #000000);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 6px rgba(0,0,0,0.08);
 }
+
+/* ── Cỡ chữ chat ──────────────────────────────────────────── */
 .stChatMessage { font-size: 15px; }
 
-/* CSS cho Spinner */
+/* ── Spinner (track trung tính, hoạt động cả sáng & tối) ─── */
 .spinner {
     width: 18px;
     height: 18px;
-    border: 2.5px solid rgba(0, 0, 0, 0.15);
-    border-top-color: #3b82f6; /* Màu xanh dương giống welcome box */
+    border: 2.5px solid rgba(128, 128, 128, 0.25);
+    border-top-color: #3b82f6;
     border-radius: 50%;
     animation: spin 1.2s linear infinite;
     margin-right: 12px;
 }
-
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* CSS TINH CHỈNH AVATAR CHATBOT */
+/* ── Avatar: trong suốt để không bị ô trắng ở dark mode ──── */
 div[data-testid="stChatMessageAvatar"] {
-    background-color: white !important;
-    border-radius: 8px !important; 
-    box-shadow: 0 1px 3px rgba(0,0,0,0.1); 
+    background-color: transparent !important;
+    border-radius: 8px !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
 }
 div[data-testid="stChatMessageAvatar"] img {
-    object-fit: contain !important; 
-    border-radius: 0px !important; 
-    padding: 2px !important; 
-    transform: scale(1.1); 
+    object-fit: contain !important;
+    border-radius: 0px !important;
+    padding: 2px !important;
+    transform: scale(1.1);
 }
 
+/* ── Welcome box: dùng opacity thay hard-code màu ─────────── */
+.vprint-welcome {
+    border-radius: 8px;
+    padding: 16px;
+    border-left: 5px solid #3b82f6;
+    line-height: 1.6;
+    font-size: 15.5px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    /* nền + chữ thích nghi theme */
+    background-color: rgba(59, 130, 246, 0.08);
+    color: var(--text-color);
+}
+
+/* ── Thinking / shimmer ────────────────────────────────────── */
 .thinking-shell {
     display: inline-flex;
     align-items: center;
@@ -122,6 +149,7 @@ div[data-testid="stChatMessageAvatar"] img {
     padding: 4px 0 10px 0;
 }
 
+/* light mode */
 .thinking-text {
     font-size: 16px;
     font-weight: 500;
@@ -142,13 +170,45 @@ div[data-testid="stChatMessageAvatar"] img {
     animation: thinking-shimmer 1.7s ease-in-out infinite;
 }
 
-@keyframes thinking-shimmer {
-    0% {
+/* dark mode override */
+@media (prefers-color-scheme: dark) {
+    .thinking-text {
+        color: rgba(209, 213, 219, 0.45);
+        background: linear-gradient(
+            110deg,
+            rgba(209, 213, 219, 0.28) 0%,
+            rgba(209, 213, 219, 0.55) 35%,
+            rgba(255, 255, 255, 0.92) 48%,
+            rgba(209, 213, 219, 0.55) 61%,
+            rgba(209, 213, 219, 0.28) 100%
+        );
+        background-size: 220% 100%;
         background-position: 120% 0;
+        -webkit-background-clip: text;
+        background-clip: text;
     }
-    100% {
-        background-position: -30% 0;
-    }
+}
+
+/* Streamlit data-theme attribute (overrides prefers-color-scheme) */
+[data-theme="dark"] .thinking-text {
+    color: rgba(209, 213, 219, 0.45);
+    background: linear-gradient(
+        110deg,
+        rgba(209, 213, 219, 0.28) 0%,
+        rgba(209, 213, 219, 0.55) 35%,
+        rgba(255, 255, 255, 0.92) 48%,
+        rgba(209, 213, 219, 0.55) 61%,
+        rgba(209, 213, 219, 0.28) 100%
+    );
+    background-size: 220% 100%;
+    background-position: 120% 0;
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+
+@keyframes thinking-shimmer {
+    0%   { background-position: 120% 0; }
+    100% { background-position: -30% 0; }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -196,7 +256,7 @@ DEFAULT_COLUMNS = [
 ]
 
 WELCOME = """
-<div style="background-color: #f0f8ff; border-radius: 8px; padding: 16px; border-left: 5px solid #3b82f6; line-height: 1.6; font-size: 15.5px; color: #1e293b; margin-bottom: 20px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+<div class="vprint-welcome">
     <span style="font-size: 24px;">👋</span> <b>Xin chào! Tôi là trợ lý ảo của VPRINT</b><br>
     Tôi có thể hỗ trợ bạn:<br>
     🔍 <b>Tìm kiếm máy móc</b> (Máy in, máy bế, dán thùng...)<br>
@@ -2775,3 +2835,11 @@ QUY TẮC TRÌNH BÀY BẮT BUỘC:
             log_chat_to_gsheet_async(user_query, error_msg, decision.intent, 0, 0, selected_model)
 
         st.caption(f"⏱ Phản hồi: **{round(time.perf_counter() - start, 2)}s** | 🎯 Phân tích: `{decision.intent}` | 🪙 Token: **{st.session_state.api_tokens}**")
+
+        # Auto-scroll xuống cuối sau mỗi lượt bot trả lời
+        st.markdown(
+            "<script>window.parent.document.querySelector"
+            "('[data-testid=\"stChatMessageContainer\"]')"
+            "?.scrollTo({top:999999,behavior:'smooth'});</script>",
+            unsafe_allow_html=True,
+        )
