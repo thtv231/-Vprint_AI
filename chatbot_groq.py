@@ -102,6 +102,17 @@ div[data-testid="stVerticalBlock"] div.stButton > button:hover {
 /* ── Cỡ chữ chat ──────────────────────────────────────────── */
 .stChatMessage { font-size: 15px; }
 
+/* Reset: ngăn background-clip / -webkit-text-fill-color từ
+   .thinking-text lan ra các element khác trong chat */
+.stChatMessage *,
+.stMarkdown *,
+div[data-testid="stChatMessageContent"] * {
+    color: inherit !important;
+    -webkit-text-fill-color: unset !important;
+    background-clip: unset !important;
+    -webkit-background-clip: unset !important;
+}
+
 /* ── Spinner (track trung tính, hoạt động cả sáng & tối) ─── */
 .spinner {
     width: 18px;
@@ -151,6 +162,7 @@ div[data-testid="stChatMessageAvatar"] img {
 
 /* light mode */
 .thinking-text {
+    display: inline-block;   /* isolate shimmer — ngăn leak ra parent */
     font-size: 16px;
     font-weight: 500;
     letter-spacing: -0.02em;
@@ -2094,6 +2106,72 @@ with chat_container:
     if len(st.session_state.history) == 0: 
         st.markdown(WELCOME, unsafe_allow_html=True)
 
+# Smart scroll — chạy 1 lần khi page load, MutationObserver tự watch DOM liên tục
+components.html(
+    """
+    <script>
+    (function () {
+        const parentWin  = window.parent;
+        const parentDoc  = parentWin.document;
+
+        // --- helpers ---
+        function getScrollEl() {
+            // Streamlit đặt scroll trên cửa sổ chính hoặc một container cụ thể
+            return parentDoc.scrollingElement || parentDoc.documentElement || parentDoc.body;
+        }
+
+        function isNearBottom(threshold) {
+            var el = getScrollEl();
+            return (el.scrollHeight - el.scrollTop - el.clientHeight) <= (threshold || 200);
+        }
+
+        function getLastMessage() {
+            var msgs = parentDoc.querySelectorAll('div[data-testid="stChatMessage"]');
+            return msgs.length > 0 ? msgs[msgs.length - 1] : null;
+        }
+
+        function scrollToBottom(force) {
+            if (!force && !isNearBottom(200)) return; // user đang đọc lịch sử → không kéo xuống
+            var last = getLastMessage();
+            if (last) {
+                last.scrollIntoView({ behavior: "smooth", block: "start" });
+            } else {
+                var el = getScrollEl();
+                el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+            }
+        }
+
+        // --- theo dõi số lượng message để phát hiện message mới ---
+        var lastMsgCount = parentDoc.querySelectorAll('div[data-testid="stChatMessage"]').length;
+
+        var debounceTimer = null;
+        var observer = new MutationObserver(function () {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(function () {
+                var currentCount = parentDoc.querySelectorAll('div[data-testid="stChatMessage"]').length;
+                var isNewMessage = currentCount > lastMsgCount;
+                lastMsgCount = currentCount;
+
+                if (isNewMessage) {
+                    // Message mới xuất hiện (user vừa gửi hoặc bot vừa reply) → force scroll
+                    scrollToBottom(true);
+                } else {
+                    // DOM thay đổi do stream (text đang render) → chỉ scroll nếu đang ở gần cuối
+                    scrollToBottom(false);
+                }
+            }, 60);
+        });
+
+        var rootEl = parentDoc.querySelector('div[data-testid="stVerticalBlock"]') || parentDoc.body;
+        observer.observe(rootEl, { childList: true, subtree: true });
+
+        // Không disconnect — observer sống suốt phiên để handle streaming liên tục
+    })();
+    </script>
+    """,
+    height=0,
+)
+
 # ==========================================
 # 2. INPUT NGƯỜI DÙNG (CUSTOM GEMINI UI - WHITE & VOICE)
 # ==========================================
@@ -2125,34 +2203,20 @@ st.markdown(
         font-family: var(--chat-font) !important;
     }}
 
-    /* Light mode — giữ nền trắng nhẹ */
-    @media (prefers-color-scheme: light) {{
-        .stApp,
-        .main .block-container,
-        html, body,
-        [data-testid="stAppViewContainer"],
-        [data-testid="stAppViewContainer"] > .main {{
-            background: #fcfcfc !important;
-        }}
+    /* Background: chỉ set #fcfcfc khi KHÔNG phải dark mode
+       Dùng :not([data-theme="dark"]) để tôn trọng Streamlit dark theme */
+    html:not([data-theme="dark"]) .stApp,
+    html:not([data-theme="dark"]) .main .block-container,
+    html:not([data-theme="dark"]) body,
+    html:not([data-theme="dark"]) [data-testid="stAppViewContainer"],
+    html:not([data-theme="dark"]) [data-testid="stAppViewContainer"] > .main {{
+        background: #fcfcfc !important;
     }}
 
-    /* Dark mode — Streamlit tự xử lý nền tối, không override */
-    @media (prefers-color-scheme: dark) {{
-        .stApp,
-        .main .block-container,
-        html, body,
-        [data-testid="stAppViewContainer"],
-        [data-testid="stAppViewContainer"] > .main {{
-            background: inherit !important;
-        }}
-    }}
-
-    /* Sidebar — chỉ áp gradient ở light mode */
-    @media (prefers-color-scheme: light) {{
-        section[data-testid="stSidebar"] {{
-            background: linear-gradient(180deg, #d7dee8 0%, #c6d0dc 100%) !important;
-            border-right: 1px solid #b9c5d3;
-        }}
+    /* Sidebar gradient — chỉ light mode */
+    html:not([data-theme="dark"]) section[data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, #d7dee8 0%, #c6d0dc 100%) !important;
+        border-right: 1px solid #b9c5d3;
     }}
     section[data-testid="stSidebar"] > div {{
         background: transparent !important;
@@ -2546,7 +2610,22 @@ if user_query:
         with st.chat_message("user", avatar="👤"): 
             st.markdown(user_query)
         st.session_state.history.append(("user", user_query))
-        st.session_state.api_tokens = 0 
+        st.session_state.api_tokens = 0
+
+        # Force-scroll ngay khi user gửi message — không cần check isNearBottom
+        components.html(
+            """<script>
+            (function(){
+                var d=window.parent.document,
+                    el=d.scrollingElement||d.documentElement||d.body,
+                    msgs=d.querySelectorAll('div[data-testid="stChatMessage"]'),
+                    last=msgs.length?msgs[msgs.length-1]:null;
+                if(last){last.scrollIntoView({behavior:'smooth',block:'start'});}
+                else{el.scrollTo({top:el.scrollHeight,behavior:'smooth'});}
+            })();
+            </script>""",
+            height=0,
+        )
         
         # Auto notify sales via email when user sends booking/contact lead info.
         is_lead, lead_payload = detect_booking_lead(user_query)
@@ -2899,55 +2978,5 @@ QUY TẮC TRÌNH BÀY BẮT BUỘC:
             log_chat_to_gsheet_async(user_query, error_msg, decision.intent, 0, 0, selected_model)
 
         st.caption(f"⏱ Phản hồi: **{round(time.perf_counter() - start, 2)}s** | 🎯 Phân tích: `{decision.intent}` | 🪙 Token: **{st.session_state.api_tokens}**")
+        # Scroll được xử lý bởi MutationObserver (init_smart_scroll) đã khởi động lúc page load
 
-        # Auto-scroll xuống cuối — retry delays + MutationObserver để đảm bảo
-        # Streamlit render xong message mới trước khi scroll
-        components.html(
-            """
-            <script>
-            (function () {
-                const parentWin = window.parent;
-                const parentDoc = parentWin.document;
-
-                function getLastMessage() {
-                    const msgs = parentDoc.querySelectorAll('div[data-testid="stChatMessage"]');
-                    return msgs.length > 0 ? msgs[msgs.length - 1] : null;
-                }
-
-                function doScroll() {
-                    const last = getLastMessage();
-                    if (last) {
-                        last.scrollIntoView({ behavior: "smooth", block: "start" });
-                    } else {
-                        parentWin.scrollTo({ top: parentDoc.body.scrollHeight, behavior: "smooth" });
-                    }
-                }
-
-                // Thử ngay lập tức
-                doScroll();
-
-                // Retry với backoff — đảm bảo scroll sau khi Streamlit render xong
-                [100, 300, 600, 1000].forEach(ms => setTimeout(doScroll, ms));
-
-                // MutationObserver: scroll ngay khi DOM thay đổi (message mới xuất hiện)
-                let scrollTimer = null;
-                const observer = new MutationObserver(() => {
-                    clearTimeout(scrollTimer);
-                    scrollTimer = setTimeout(() => {
-                        doScroll();
-                        observer.disconnect();
-                    }, 80);
-                });
-
-                const chatContainer = parentDoc.querySelector(
-                    'div[data-testid="stVerticalBlock"]'
-                ) || parentDoc.body;
-                observer.observe(chatContainer, { childList: true, subtree: true });
-
-                // Auto-disconnect sau 3s tránh memory leak
-                setTimeout(() => observer.disconnect(), 3000);
-            })();
-            </script>
-            """,
-            height=0,
-        )
