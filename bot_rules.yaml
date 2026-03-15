@@ -1,6 +1,28 @@
+# =============================================================
+# bot_rules.yaml — VPRINT Chatbot Rules
+# =============================================================
+# THAY ĐỔI SO VỚI BẢN CŨ:
+#
+# 1. [cup_making] Thêm: to giay, bat giay, lam to, hop giay dung nuoc,
+#    tu giay, bowl, food container — fix lỗi "tô giấy" → bucket unknown
+#
+# 2. [out_of_scope consumer_markers] Xóa "inkjet" và "printer" khỏi
+#    consumer_markers — đây là từ khóa CÔNG NGHIỆP (máy in phun UV,
+#    inkjet industrial). Giữ chúng gây router nhầm troubleshooting → out_of_scope
+#
+# 3. [operation_buckets printing] Xóa "in" đơn lẻ — quá chung chung,
+#    match nhầm với "máy làm tô giấy đựng nước nóng" (có chữ "in" trong "đựng")
+#    Giữ "offset", "flexo" và các từ cụ thể hơn
+#
+# 4. [router_rules few_shot_examples] Thêm ví dụ troubleshooting
+#    cho máy in phun công nghiệp + ví dụ out_of_scope đúng chuẩn
+#
+# 5. [operation_buckets notebook_making] Thêm bucket mới cho máy làm vở/sách
+#    để "Máy làm vở bài tập" không lọt vào kết quả tìm máy khác danh mục
+# =============================================================
+
 # Quy tắc nhận diện ngôn ngữ đầu vào của khách hàng (Việt/Anh)
 language_detection:
-  # Từ khóa tiếng Việt có dấu, dùng khi người dùng gõ tự nhiên
   vi_markers:
     - "máy"
     - "giá"
@@ -23,7 +45,6 @@ language_detection:
     - "vprint"
     - "tiếng việt"
 
-  # Từ khóa tiếng Anh thường gặp trong ngữ cảnh hỏi máy/công nghệ
   en_markers:
     - "what"
     - "how"
@@ -60,9 +81,8 @@ language_detection:
     - "label"
     - "recommendation"
 
-# Quy tắc nhận diện truy vấn ngoài phạm vi kinh doanh (máy dân dụng/văn phòng)
+# Quy tắc nhận diện truy vấn ngoài phạm vi kinh doanh
 out_of_scope_rules:
-  # Nhóm từ khóa máy in gia đình/văn phòng/cá nhân
   consumer_markers:
     - "dung trong nha"
     - "trong nha"
@@ -74,7 +94,6 @@ out_of_scope_rules:
     - "mini"
     - "bill"
     - "hoa don"
-    - "printer"
     - "home printer"
     - "office printer"
     - "home use"
@@ -85,12 +104,19 @@ out_of_scope_rules:
     - "school"
     - "student"
     - "desktop printer"
-    - "inkjet"
+    # "inkjet" và "printer" đã XÓA — đây là từ khóa công nghiệp
+    # (máy in phun UV, inkjet industrial) không phải consumer
     - "laser printer"
     - "receipt printer"
     - "small business printer"
+    # Thêm: tên model máy văn phòng rõ ràng
+    - "canon"
+    - "epson"
+    - "hp deskjet"
+    - "brother"
+    - "pixma"
+    - "deskjet"
 
-  # Nhóm từ khóa máy in công nghiệp/xưởng để tránh chặn nhầm
   industrial_markers:
     - "cong nghiep"
     - "nha xuong"
@@ -109,10 +135,15 @@ out_of_scope_rules:
     - "high volume"
     - "corrugated"
     - "packaging line"
+    # Thêm: từ khóa công nghiệp bị thiếu
+    - "carton"
+    - "bao bì"
+    - "inkjet cong nghiep"
+    - "uv inkjet"
+    - "in phun cong nghiep"
 
-# Từ khóa chuyên biệt cho câu hỏi kiến thức CTP (chế bản)
+# Từ khóa chuyên biệt cho câu hỏi kiến thức CTP
 ctp_knowledge_rules:
-  # Nhóm từ khóa nhận diện chủ đề CTP
   ctp_terms:
     - "ctp"
     - "thermal plate"
@@ -124,7 +155,6 @@ ctp_knowledge_rules:
     - "prepress plate"
     - "offset plate"
 
-  # Nhóm từ khóa mang ý nghĩa so sánh/đánh giá
   compare_terms:
     - "khac nhau"
     - "su khac biet"
@@ -139,7 +169,6 @@ ctp_knowledge_rules:
     - "pros and cons"
     - "which is better"
 
-  # Nhóm từ khóa nghiêng về mua máy (không phải hỏi kiến thức)
   machine_buy_terms:
     - "may"
     - "model"
@@ -156,7 +185,9 @@ ctp_knowledge_rules:
     - "investment"
     - "book a demo"
 
-# Nhóm từ khóa phân loại công đoạn sản xuất để route đúng nghiệp vụ
+# Phân loại công đoạn sản xuất — dùng cho Hard Bucketing (-500 penalty)
+# QUAN TRỌNG: keyword phải là dạng đã normalize (không dấu, chữ thường)
+# vì get_operation_bucket() gọi normalize_for_match() trước khi match
 operation_buckets:
   # Cán màng / phủ bề mặt
   lamination:
@@ -212,24 +243,27 @@ operation_buckets:
     - "plate setter"
     - "prepress"
 
-  # Công đoạn in
+  # Công đoạn in — XÓA "in" đơn lẻ (quá chung, match nhầm)
   printing:
-    - "in"
     - "offset"
     - "flexo"
     - "digital"
-    - "printer"
     - "kts"
     - "ong dong"
     - "gravure"
-    - "print"
     - "printing machine"
     - "offset printing"
     - "flexographic"
     - "digital printing"
     - "wide format"
+    - "may in offset"
+    - "may in flexo"
+    - "may in phun"
+    - "inkjet industrial"
+    - "in phun cong nghiep"
+    - "in phun uv"
 
-  # Xén/cắt giấy thành phẩm
+  # Xén/cắt giấy
   cutting:
     - "xen"
     - "cat giay"
@@ -239,20 +273,48 @@ operation_buckets:
     - "sheeter"
     - "slitter"
 
-  # Làm ly/cốc giấy
+  # Làm ly/cốc/tô giấy — ĐÃ BỔ SUNG ĐẦY ĐỦ
   cup_making:
     - "ly giay"
     - "coc giay"
+    - "to giay"          # FIX CHÍNH — đây là nguyên nhân bug
+    - "bat giay"         # bát giấy
+    - "tu giay"          # tú giấy / hộp tròn
     - "lam ly"
     - "lam coc"
+    - "lam to"           # làm tô
+    - "lam bat"          # làm bát
     - "paper cup"
     - "paper cup machine"
     - "cup forming"
     - "cup making"
+    - "paper bowl"
+    - "food container"
+    - "hop dung nuoc"    # hộp đựng nước
+    - "dung nuoc nong"   # đựng nước nóng
+    - "dung do uong"     # đựng đồ uống
+    - "takeaway cup"
+    - "coffee cup machine"
+    - "dung thuc an"     # đựng thức ăn (giấy)
+
+  # Làm vở/sách/ấn phẩm — BUCKET MỚI
+  # Ngăn "Máy làm vở bài tập" lọt vào kết quả danh mục khác
+  notebook_making:
+    - "lam vo"           # làm vở
+    - "vo bai tap"       # vở bài tập
+    - "dong sach"        # đóng sách
+    - "dong quyen"       # đóng quyển
+    - "bi sach"          # bìa sách
+    - "notebook"
+    - "exercise book"
+    - "bookbinding"
+    - "book binding"
+    - "perfect binding"
+    - "saddle stitch"
+    - "lam quyen"        # làm quyển
 
 # Từ khóa phân luồng hội thoại (intent routing)
 intent_routing:
-  # Chào hỏi/cảm ơn/trò chuyện ngắn
   direct_chat:
     - "xin chao"
     - "hello"
@@ -270,7 +332,6 @@ intent_routing:
     - "thank you"
     - "bye"
 
-  # Hỏi kiến thức nền tảng/nguyên lý/so sánh công nghệ
   book_knowledge:
     - "cong nghe"
     - "la gi"
@@ -298,7 +359,6 @@ intent_routing:
     - "advantages"
     - "disadvantages"
 
-  # Hành động tìm máy/báo giá/thông số cụ thể
   find_machine_actions:
     - "tim may"
     - "can mua"
@@ -330,7 +390,6 @@ intent_routing:
     - "price quote"
     - "recommend machine"
 
-  # Từ khóa thiên về bài toán tư vấn giải pháp/dây chuyền
   consulting_markers:
     - "tu van"
     - "giai phap"
@@ -345,9 +404,8 @@ intent_routing:
     - "planning"
     - "investment plan"
 
-# Quy tắc nhận diện câu phụ thuộc ngữ cảnh hay mở truy vấn mới
+# Quy tắc nhận diện câu phụ thuộc ngữ cảnh
 context_dependency:
-  # Câu nối theo ngữ cảnh trước đó (follow-up)
   followup_markers:
     - "y tren"
     - "cau tren"
@@ -380,7 +438,6 @@ context_dependency:
     - "can you explain more"
     - "more details"
 
-  # Câu tinh chỉnh/lọc thêm theo yêu cầu mới trên cùng chủ đề
   refine_markers:
     - "loai co"
     - "loai dung"
@@ -411,7 +468,6 @@ context_dependency:
     - "manual"
     - "another model"
 
-  # Tín hiệu mở truy vấn tìm máy mới (thường dùng để reset context)
   new_search_signals:
     - "tim may"
     - "cho xem"
@@ -433,3 +489,49 @@ context_dependency:
     - "offset machine"
     - "flexo machine"
     - "die cutting machine"
+
+# Quy tắc cho semantic router
+router_rules:
+  few_shot_examples: |-
+    [Ví dụ ĐÚNG]
+    Q: "tôi muốn tìm máy làm tô giấy đựng nước nóng"
+    → intent: find_machine
+    # "làm tô giấy" = tìm máy sản xuất, không phải tư vấn dây chuyền
+
+    Q: "máy nào phù hợp cho xưởng in 500m2 sản lượng 10000 tờ/ngày"
+    → intent: solution_consulting
+    # Có thông số xưởng cụ thể = tư vấn dây chuyền
+
+    Q: "máy bế die cut của VPRINT có không"
+    → intent: find_machine
+
+    Q: "máy flexo bên anh in bị lem mực và dot gain tăng mạnh, xử lý sao"
+    → intent: troubleshooting
+
+    Q: "máy in phun carton của tôi mực ra không đều phải làm sao"
+    → intent: troubleshooting
+    # "carton" = vật liệu công nghiệp, "không đều" = lỗi vận hành → troubleshooting
+    # KHÔNG phải out_of_scope dù có "in phun"
+
+    Q: "máy in phun UV của tôi bị nghẹt đầu phun"
+    → intent: troubleshooting
+    # "UV" = công nghệ công nghiệp → troubleshooting
+
+    [Ví dụ SAI cần tránh]
+    Q: "tôi muốn tìm máy làm tô giấy đựng nước nóng"
+    → KHÔNG được: solution_consulting
+
+    Q: "máy in phun carton bị lỗi"
+    → KHÔNG được: out_of_scope
+    # Chỉ out_of_scope khi có TÊN MODEL văn phòng rõ ràng: Canon, Epson, HP, Brother
+
+    Q: "Canon 2900 của tôi kẹt giấy"
+    → ĐÚNG: out_of_scope
+    # Canon 2900 là tên model máy văn phòng rõ ràng
+
+  confidence_threshold: 0.65
+
+# Quy tắc retrieval cho Q&A và cache
+retrieval_rules:
+  qa_min_relevance: 0.62
+  qa_direct_min_relevance: 0.72
