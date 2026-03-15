@@ -2106,12 +2106,12 @@ st.markdown(
     :root {{
         --chat-font: "Source Sans Pro", sans-serif;
     }}
+
+    /* Font áp dụng cho mọi mode */
     .stApp {{
-        background: #fcfcfc;
         font-family: var(--chat-font) !important;
     }}
     .main .block-container {{
-        background: #fcfcfc;
         padding-bottom: 140px;
         position: relative;
         z-index: 0;
@@ -2121,16 +2121,41 @@ st.markdown(
         position: relative;
         z-index: 1;
     }}
-    section[data-testid="stSidebar"] {{
-        background: linear-gradient(180deg, #d7dee8 0%, #c6d0dc 100%) !important;
-        border-right: 1px solid #b9c5d3;
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main {{
+        font-family: var(--chat-font) !important;
+    }}
+
+    /* Light mode — giữ nền trắng nhẹ */
+    @media (prefers-color-scheme: light) {{
+        .stApp,
+        .main .block-container,
+        html, body,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main {{
+            background: #fcfcfc !important;
+        }}
+    }}
+
+    /* Dark mode — Streamlit tự xử lý nền tối, không override */
+    @media (prefers-color-scheme: dark) {{
+        .stApp,
+        .main .block-container,
+        html, body,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main {{
+            background: inherit !important;
+        }}
+    }}
+
+    /* Sidebar — chỉ áp gradient ở light mode */
+    @media (prefers-color-scheme: light) {{
+        section[data-testid="stSidebar"] {{
+            background: linear-gradient(180deg, #d7dee8 0%, #c6d0dc 100%) !important;
+            border-right: 1px solid #b9c5d3;
+        }}
     }}
     section[data-testid="stSidebar"] > div {{
         background: transparent !important;
-    }}
-    html, body, [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main {{
-        background: #fcfcfc !important;
-        font-family: var(--chat-font) !important;
     }}
     .stChatMessage,
     .stChatMessage *,
@@ -2247,6 +2272,8 @@ custom_chat_html = f"""
             background: transparent;
             font-family: "Source Sans Pro", sans-serif;
         }}
+
+        /* ===== CHAT CONTAINER ===== */
         .chat-container {{
             background-color: #ffffff;
             border-radius: 36px;
@@ -2258,6 +2285,13 @@ custom_chat_html = f"""
             height: 72px;
             border: 1px solid #dfdfdf;
         }}
+        /* Dark mode — toggle bởi JS khi phát hiện theme từ parent */
+        .dark-mode .chat-container {{
+            background-color: #1e1e1e;
+            border: 1px solid #3a3a3a;
+        }}
+
+        /* ===== CHAT INPUT ===== */
         .chat-input {{
             background: transparent;
             border: none;
@@ -2268,6 +2302,10 @@ custom_chat_html = f"""
             width: 100%;
         }}
         .chat-input::placeholder {{ color: #9ca3af; }}
+        .dark-mode .chat-input {{ color: #f3f4f6; }}
+        .dark-mode .chat-input::placeholder {{ color: #6b7280; }}
+
+        /* ===== ICONS ===== */
         .right-section {{ display: flex; align-items: center; gap: 12px; }}
         .icon-btn {{ cursor: pointer; display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; border-radius: 50%; transition: all 0.2s; }}
         .icon-btn svg {{ fill: #6b7280; width: 28px; height: 28px; transition: fill 0.2s; }}
@@ -2275,6 +2313,10 @@ custom_chat_html = f"""
         #mic-icon svg {{ width: 30px; height: 30px; }}
         .icon-btn:hover {{ background-color: #f3f4f6; }}
         .icon-btn:hover svg {{ fill: #111827; }}
+        .dark-mode .icon-btn svg {{ fill: #9ca3af; }}
+        .dark-mode .icon-btn:hover {{ background-color: #374151; }}
+        .dark-mode .icon-btn:hover svg {{ fill: #f3f4f6; }}
+
         .recording svg {{ fill: #ef4444 !important; animation: pulse 1.5s infinite; }}
         @keyframes pulse {{
             0% {{ transform: scale(1); }}
@@ -2329,6 +2371,28 @@ custom_chat_html = f"""
 
     <script>
         const GROQ_API_KEY = "{groq_api_key}";
+
+        // ===== DARK MODE DETECTION =====
+        // Detect data-theme từ parent Streamlit, toggle class .dark-mode vào <body> iframe
+        function applyDarkMode() {{
+            try {{
+                const parentDoc = window.parent.document;
+                const stTheme = parentDoc.documentElement.getAttribute('data-theme') || '';
+                const sysDark = window.parent.matchMedia('(prefers-color-scheme: dark)').matches;
+                const isDark = stTheme === 'dark' || sysDark;
+                document.body.classList.toggle('dark-mode', isDark);
+            }} catch(e) {{}}
+        }}
+        applyDarkMode();
+        // Re-check khi Streamlit thay đổi theme (data-theme hoặc class trên <html>)
+        try {{
+            const _themeObserver = new MutationObserver(applyDarkMode);
+            _themeObserver.observe(window.parent.document.documentElement, {{
+                attributes: true, attributeFilter: ['data-theme', 'class']
+            }});
+            window.parent.matchMedia('(prefers-color-scheme: dark)')
+                .addEventListener('change', applyDarkMode);
+        }} catch(e) {{}}
 
         const frame = window.frameElement;
         function layoutChatFrame() {{
@@ -2836,10 +2900,54 @@ QUY TẮC TRÌNH BÀY BẮT BUỘC:
 
         st.caption(f"⏱ Phản hồi: **{round(time.perf_counter() - start, 2)}s** | 🎯 Phân tích: `{decision.intent}` | 🪙 Token: **{st.session_state.api_tokens}**")
 
-        # Auto-scroll xuống cuối sau mỗi lượt bot trả lời
-        st.markdown(
-            "<script>window.parent.document.querySelector"
-            "('[data-testid=\"stChatMessageContainer\"]')"
-            "?.scrollTo({top:999999,behavior:'smooth'});</script>",
-            unsafe_allow_html=True,
+        # Auto-scroll xuống cuối — retry delays + MutationObserver để đảm bảo
+        # Streamlit render xong message mới trước khi scroll
+        components.html(
+            """
+            <script>
+            (function () {
+                const parentWin = window.parent;
+                const parentDoc = parentWin.document;
+
+                function getLastMessage() {
+                    const msgs = parentDoc.querySelectorAll('div[data-testid="stChatMessage"]');
+                    return msgs.length > 0 ? msgs[msgs.length - 1] : null;
+                }
+
+                function doScroll() {
+                    const last = getLastMessage();
+                    if (last) {
+                        last.scrollIntoView({ behavior: "smooth", block: "start" });
+                    } else {
+                        parentWin.scrollTo({ top: parentDoc.body.scrollHeight, behavior: "smooth" });
+                    }
+                }
+
+                // Thử ngay lập tức
+                doScroll();
+
+                // Retry với backoff — đảm bảo scroll sau khi Streamlit render xong
+                [100, 300, 600, 1000].forEach(ms => setTimeout(doScroll, ms));
+
+                // MutationObserver: scroll ngay khi DOM thay đổi (message mới xuất hiện)
+                let scrollTimer = null;
+                const observer = new MutationObserver(() => {
+                    clearTimeout(scrollTimer);
+                    scrollTimer = setTimeout(() => {
+                        doScroll();
+                        observer.disconnect();
+                    }, 80);
+                });
+
+                const chatContainer = parentDoc.querySelector(
+                    'div[data-testid="stVerticalBlock"]'
+                ) || parentDoc.body;
+                observer.observe(chatContainer, { childList: true, subtree: true });
+
+                // Auto-disconnect sau 3s tránh memory leak
+                setTimeout(() => observer.disconnect(), 3000);
+            })();
+            </script>
+            """,
+            height=0,
         )
